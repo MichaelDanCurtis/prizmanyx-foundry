@@ -70,6 +70,20 @@ HEALTH_POLL_INTERVAL_SECONDS = 1.0
 DOCKER_QUICK_TIMEOUT_SECONDS = 30.0
 DOCKER_RUN_TIMEOUT_SECONDS = 300.0
 
+# The host docker socket, bind-mounted into a floci container so its
+# real-engine services can spawn their OWN backing child containers on the
+# host daemon: the AWS floci container for RDS/EC2/ElastiCache, and - as a
+# 2026-08-31 live probe corrected an earlier under-informed assumption -
+# floci-az for its DB services too (a PostgreSQL flexibleServers CREATE
+# returns 500 WITHOUT this mount and 202 WITH it, spawning a real
+# `floci-az-pg-<name>` postgres child). Bind-mounting the docker socket is
+# HOST-ROOT-EQUIVALENT and is a DELIBERATE, local-dev-only choice: foundry
+# is a single-operator tool that manufactures throwaway test estates on the
+# operator's own machine, never network-exposed. Both floci containers get
+# the identical mount from this one constant, so the AWS and Azure sides can
+# never drift apart on it.
+_DOCKER_SOCKET_MOUNT = ["-v", "/var/run/docker.sock:/var/run/docker.sock"]
+
 # `docker rm -f <missing container>` exits 0 (NOT an error) while writing
 # this to stderr - verified directly against a real daemon (docker
 # 29.6.2), which is what `remove_env`'s primary reap path keys off of to
@@ -309,8 +323,7 @@ def create_env(
             container,
             "-p",
             f"{port}:4566",
-            "-v",
-            "/var/run/docker.sock:/var/run/docker.sock",
+            *_DOCKER_SOCKET_MOUNT,
             floci_image(),
         ],
         timeout=DOCKER_RUN_TIMEOUT_SECONDS,
@@ -358,10 +371,14 @@ def _start_az_container(name: str, *, aws_container: str) -> int:
     create already brought up - before re-raising, so a two-container create
     that fails halfway never leaves the AWS half running orphaned.
 
-    No docker-socket mount: floci-az's vm service is mocked (no docker), and
-    only its functions service touches a socket, which no slice-4 resource
-    type exercises. Confirmed healthy without the mount in Task 1's live
-    probe; revisit if a later resource type needs a floci-az child container.
+    Gets the docker-socket mount (`_DOCKER_SOCKET_MOUNT`), identical to the
+    AWS floci container. An earlier revision omitted it on the belief that
+    floci-az needed no host daemon; a 2026-08-31 live probe corrected that -
+    floci-az is a real-engine host for its DB services (a PostgreSQL
+    flexibleServers CREATE returns 500 WITHOUT the socket and 202 WITH it,
+    spawning a real `floci-az-pg-<name>` postgres child that `remove_env`
+    then reaps). See `_DOCKER_SOCKET_MOUNT` for the host-root-equivalent,
+    local-dev-only rationale.
     """
     az_port = floci_az_port()
     az_container = az_container_name(name)
@@ -377,6 +394,7 @@ def _start_az_container(name: str, *, aws_container: str) -> int:
             az_container,
             "-p",
             f"{az_port}:{FLOCI_AZ_INTERNAL_PORT}",
+            *_DOCKER_SOCKET_MOUNT,
             floci_az_image(),
         ],
         timeout=DOCKER_RUN_TIMEOUT_SECONDS,

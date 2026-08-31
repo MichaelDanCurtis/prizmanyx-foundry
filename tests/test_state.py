@@ -184,6 +184,16 @@ def test_validate_env_name_accepts_a_name_that_merely_contains_a_stem_mid_string
     validate_env_name("my-rds-clone")  # must not raise
 
 
+def test_child_name_prefixes_includes_the_az_postgres_child_prefix():
+    # floci-az is a real-engine host too: a PostgreSQL flexible server spawns
+    # a real backing child named `floci-az-pg-<resource>` (live-confirmed -
+    # flexibleServers CREATE -> 202 WITH the docker socket, container image
+    # postgres:17-alpine). Recognizing this prefix is what lets the reap
+    # heuristic treat those children as reapable, exactly like the AWS
+    # rds-/ec2-/elasticache- children.
+    assert "floci-az-pg-" in CHILD_NAME_PREFIXES
+
+
 # --- env name / az-prefix collision rejection -----------------------------
 # CRITICAL create-time collision: az_container_name("foo") == "floci-az-foo"
 # == container_name("az-foo"). An env named "az-foo" gets AWS parent

@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import socket
 import subprocess
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -321,6 +322,32 @@ def test_select_children_to_reap_spares_a_peers_az_parent_container_case_c():
     assert [row.name for row in selection.spare] == ["floci-az-peer"]
 
 
+def test_select_children_to_reap_reaps_an_az_pg_child_while_sparing_a_peer_az_parent():
+    # floci-az is a real-engine host, like the AWS floci container: a
+    # PostgreSQL flexible server spawns a real backing child container named
+    # `floci-az-pg-<resource>` (live-confirmed - flexibleServers CREATE
+    # returns 202 WITH the docker socket and the child image is
+    # postgres:17-alpine). That child must be reaped as the target's own,
+    # while a PEER env's Azure PARENT `floci-az-<peer>` is spared. The two
+    # are DIFFERENT strings and the logic must distinguish them: the peer
+    # parent by EXACT membership in other_parent_names (rule 1), the pg child
+    # by its `floci-az-pg-` CHILD prefix. The peer is younger than the child
+    # here so rule 3 does not ALSO spare the child - isolating the
+    # prefix-vs-parent distinction as the thing under test.
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    target = _env("target", t0)
+    peer = _env("peer", t0 + timedelta(minutes=10))
+    az_pg_child = _row("floci-az-pg-somedb", t0 + timedelta(minutes=2))  # target's own
+    peer_az_parent = _row(az_container_name("peer"), t0 + timedelta(seconds=5))
+    assert az_pg_child.name.startswith("floci-az-pg-"), "an az real-engine child"
+    assert peer_az_parent.name == "floci-az-peer", "a peer's az PARENT, not a child"
+
+    selection = select_children_to_reap([az_pg_child, peer_az_parent], target, [target, peer])
+
+    assert [row.name for row in selection.reap] == ["floci-az-pg-somedb"]
+    assert [row.name for row in selection.spare] == ["floci-az-peer"]
+
+
 def test_select_children_to_reap_auto_reaps_nothing_once_two_environments_are_alive():
     # The honest cost of the case-A2 fix, made explicit: with target plus
     # one OTHER live environment (regardless of which is older), every row
@@ -407,6 +434,31 @@ def test_remove_env_reaps_exactly_the_recorded_children_when_present(tmp_path, m
     # knows exactly what to remove, so it must never even ask.
     assert not any(call[:2] == ["ps", "-a"] for call in fake_docker.calls)
     assert not state.state_file("target").exists()
+
+
+def test_remove_env_reaps_a_recorded_az_pg_child_and_removes_the_az_parent_by_name(
+    tmp_path, monkeypatch
+):
+    # The path Task 3's ARM materializer will use (mirroring tf_runner):
+    # floci-az real-engine children recorded on EnvState.children are reaped
+    # by EXACT name, unconditionally. A `floci-az-pg-<name>` child is just
+    # another recorded name to the PRIMARY path - no heuristic, no ambiguity.
+    # Also pins that remove_env removes the env's OWN az parent
+    # (`floci-az-target`) by name, before the reap.
+    target = _env("target", datetime(2026, 1, 1, tzinfo=UTC)).model_copy(
+        update={"children": ["floci-az-pg-mydb", "floci-ec2-i-abc"]}
+    )
+    _save_env_in_isolated_dir(tmp_path, monkeypatch, target)
+    fake_docker = _FakeDocker()
+    monkeypatch.setattr("foundry.engine.run_docker", fake_docker)
+
+    report = remove_env("target")
+
+    assert sorted(report.reaped) == ["floci-az-pg-mydb", "floci-ec2-i-abc"]
+    assert report.already_gone == []
+    # Both parents removed by name (AWS then az), before any child reap.
+    assert ["rm", "-f", "floci-target"] in fake_docker.calls
+    assert ["rm", "-f", "floci-az-target"] in fake_docker.calls
 
 
 def test_remove_env_reports_a_manually_removed_recorded_child_as_already_gone_not_reaped(
@@ -749,16 +801,49 @@ def test_create_status_remove_round_trip_leaves_no_containers_behind():
 ENV_NAME_AZ = "t4-az-test"
 
 
+_AZ_PG_SERVER = "t4azpg"
+_AZ_PG_CHILD = f"floci-az-pg-{_AZ_PG_SERVER}"
+
+
+def _put_flexible_server(az_port: int, server: str) -> int:
+    """PUT a PostgreSQL flexibleServer against floci-az's ARM plane; return
+    the HTTP status. floci-az spawns a real `floci-az-pg-<server>` postgres
+    child only when it can reach the host docker daemon - so this call is
+    what exercises the socket mount end to end. The response BLOCKS until the
+    child is provisioned (observed ~60s in the live probe), then returns 202,
+    so the read timeout is generous enough to cover a cold `postgres:17-alpine`
+    pull."""
+    import httpx
+
+    url = (
+        f"http://localhost:{az_port}/subscriptions/"
+        "00000000-0000-0000-0000-000000000000/resourceGroups/rg-t4/providers/"
+        f"Microsoft.DBforPostgreSQL/flexibleServers/{server}?api-version=2022-12-01"
+    )
+    body = {
+        "location": "eastus",
+        "sku": {"name": "Standard_D2s_v3", "tier": "GeneralPurpose"},
+        "properties": {
+            "administratorLogin": "pgadmin",
+            "administratorLoginPassword": "Passw0rd!23",
+            "version": "14",
+            "storage": {"storageSizeGB": 32},
+        },
+    }
+    return httpx.put(url, json=body, timeout=180.0).status_code
+
+
 @pytest.mark.docker
-def test_create_with_azure_brings_up_both_planes_serves_arm_and_removes_cleanly():
-    # The slice-4 acceptance: an Azure-enabled create stands up BOTH the
-    # AWS control plane (dynamic port) and the floci-az ARM plane (the fixed
-    # az port), both report healthy, the ARM plane actually answers
-    # `GET /metadata/endpoints` with a 200, and `remove_env` tears both down
-    # leaving no residue under either name. The floci-az container is
-    # started WITHOUT the docker-socket mount (its vm service is mocked; only
-    # its functions service needs a socket, which no slice-4 resource type
-    # exercises) - so this test also confirms it goes healthy without it.
+def test_create_with_azure_spawns_a_real_pg_child_and_reaps_it_on_remove():
+    # The slice-4 acceptance, corrected: an Azure-enabled create stands up
+    # BOTH the AWS control plane (dynamic port) and the floci-az ARM plane
+    # (the fixed az port), both healthy, the ARM plane answers
+    # `GET /metadata/endpoints` with a 200 - all WITH the docker-socket mount
+    # (an earlier revision wrongly omitted it). Then it proves floci-az is a
+    # real-engine host: a PostgreSQL flexibleServers CREATE returns 202 and
+    # spawns a real `floci-az-pg-<name>` postgres child (which only happens
+    # BECAUSE the socket is mounted - 500 without it), and `remove_env` reaps
+    # that child along with both parents, leaving no residue anywhere.
     import httpx
 
     spec = EnvSpec(name_prefix="t4-az-test")
@@ -768,25 +853,55 @@ def test_create_with_azure_brings_up_both_planes_serves_arm_and_removes_cleanly(
         assert created.ports["az"] == floci_az_port()
 
         status = env_status(ENV_NAME_AZ)
-        assert status.status == "healthy", "both containers must be healthy"
+        assert status.status == "healthy", "both containers must be healthy WITH the socket"
 
-        response = httpx.get(
+        endpoints = httpx.get(
             f"http://localhost:{created.ports['az']}/metadata/endpoints", timeout=10.0
         )
-        assert response.status_code == 200
+        assert endpoints.status_code == 200
+
+        # Provision a real postgres flexible server; the socket is what lets
+        # floci-az spawn its backing child.
+        assert _put_flexible_server(created.ports["az"], _AZ_PG_SERVER) == 202
+
+        # The child container must appear - proof the socket mount works
+        # (floci-az returns 500 and spawns nothing without it).
+        deadline = time.monotonic() + 90.0
+        while time.monotonic() < deadline:
+            if _docker_ps_names(_AZ_PG_CHILD):
+                break
+            time.sleep(1.0)
+        assert _docker_ps_names(_AZ_PG_CHILD) == [_AZ_PG_CHILD], (
+            "floci-az must spawn a real postgres child with the socket mounted"
+        )
+
+        # Record the az child on the env state, exactly as Task 3's ARM
+        # materializer will (a tf_runner-style docker-ps delta around the
+        # apply). This is the RELIABLE reap path: `remove_env`'s PRIMARY,
+        # recorded-children branch reaps by exact name, unconditionally. The
+        # created_at HEURISTIC deliberately cannot be trusted for a
+        # just-spawned child - docker's `ps` CreatedAt is whole-second, so a
+        # child created in the same second `EnvState.created_at` was stamped
+        # rounds DOWN below it and the heuristic SPARES it (erring toward an
+        # orphan, never toward over-reaping a live peer). Recording is how
+        # the estate's own children get reaped for certain.
+        recorded = state.load_state(ENV_NAME_AZ).model_copy(update={"children": [_AZ_PG_CHILD]})
+        state.save_state(recorded)
 
         report = remove_env(ENV_NAME_AZ)
-        assert report.reaped == []  # no terraform apply - nothing to have spawned
+        assert _AZ_PG_CHILD in report.reaped, "remove_env must reap the recorded floci-az-pg child"
     finally:
-        # Raw cleanup of BOTH containers plus the state dir, whatever failed
-        # above - two exact container names, never the prizmanyx-* stack.
-        subprocess.run(
-            ["docker", "rm", "-f", container_name(ENV_NAME_AZ)], capture_output=True, check=False
-        )
-        subprocess.run(
-            ["docker", "rm", "-f", az_container_name(ENV_NAME_AZ)], capture_output=True, check=False
-        )
+        # Raw cleanup of BOTH parents, the pg child, and the state dir,
+        # whatever failed above - exact container names, never the
+        # untouchable prizmanyx-* stack.
+        for name in (
+            container_name(ENV_NAME_AZ),
+            az_container_name(ENV_NAME_AZ),
+            _AZ_PG_CHILD,
+        ):
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, check=False)
         state.delete_env_dir(ENV_NAME_AZ)
 
     assert _docker_ps_names(container_name(ENV_NAME_AZ)) == []
     assert _docker_ps_names(az_container_name(ENV_NAME_AZ)) == []
+    assert _docker_ps_names(_AZ_PG_CHILD) == []

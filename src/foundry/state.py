@@ -28,12 +28,19 @@ from pydantic import BaseModel
 ENV_NAME_PATTERN = r"^[a-z][a-z0-9-]{0,40}$"
 _ENV_NAME_RE = re.compile(ENV_NAME_PATTERN)
 
-# Floci's real-engine services (RDS, EC2, ElastiCache) back their emulated
-# resources with their own containers, named after the resource's own
-# identifier, that survive `docker rm` of the floci parent (spike-proven,
-# 2026-08-30: `floci-rds-db-*` and `floci-ec2-i-*` both survived teardown as
-# running orphans - see engine.py's `select_children_to_reap`, the actual
-# consumer of this list for its reap sweep).
+# Both floci containers are real-engine hosts: their emulated services back
+# resources with their OWN backing containers, named after the resource's
+# own identifier, that survive `docker rm` of the floci parent.
+#   - AWS floci: RDS/EC2/ElastiCache -> `floci-rds-*`, `floci-ec2-*`,
+#     `floci-elasticache-*` (spike-proven, 2026-08-30: `floci-rds-db-*` and
+#     `floci-ec2-i-*` both survived teardown as running orphans).
+#   - Azure floci-az: a PostgreSQL flexible server -> `floci-az-pg-<name>`
+#     (live-confirmed 2026-08-31: flexibleServers CREATE returns 202 WITH
+#     the docker socket, spawning a `postgres:17-alpine` child; 500 without
+#     it). floci-az needs the socket for exactly this reason - see
+#     engine._DOCKER_SOCKET_MOUNT.
+# `select_children_to_reap` (engine.py) is the actual consumer of this list
+# for its reap sweep.
 #
 # Defined HERE rather than in engine.py because this module's own name
 # validation must know it too: an environment named e.g. `rds-x` would get
@@ -45,7 +52,12 @@ _ENV_NAME_RE = re.compile(ENV_NAME_PATTERN)
 # being reaped because of this collision). One list, so the reap patterns
 # and the naming rule that avoids colliding with them can never drift
 # apart.
-CHILD_NAME_PREFIXES: tuple[str, ...] = ("floci-rds-", "floci-ec2-", "floci-elasticache-")
+CHILD_NAME_PREFIXES: tuple[str, ...] = (
+    "floci-rds-",
+    "floci-ec2-",
+    "floci-elasticache-",
+    "floci-az-pg-",
+)
 
 # Every entry above is "floci-" + a stem (e.g. "rds-"). Derived, not
 # hand-duplicated, so this and CHILD_NAME_PREFIXES can never drift apart.
