@@ -32,7 +32,7 @@ from foundry.engine import (
 )
 from foundry.envspec import EnvSpec, SpecLoadError, load_spec, random_spec
 from foundry.from_repo import FromRepoError, materialize_from_repo, placeholder_spec
-from foundry.loop import run_loop
+from foundry.loop import DEFAULT_WORKER_HOST, run_loop
 from foundry.prizmanyx_client import PrizmanyxClient
 from foundry.report import write_report
 from foundry.state import env_dir
@@ -266,6 +266,19 @@ def run_command(
         str,
         typer.Option("--prizmanyx", help="Base URL of the running Prizmanyx instance."),
     ] = _DEFAULT_PRIZMANYX_URL,
+    worker_host: Annotated[
+        str,
+        typer.Option(
+            "--worker-host",
+            help=(
+                "Hostname Prizmanyx's extraction worker container uses to reach "
+                "this environment's AWS endpoint (extraction runs there, not in "
+                "the host Prizmanyx process). Defaults to Docker Desktop's "
+                "host-gateway name; override for a Linux host-gateway address or "
+                "a worker sharing this environment's own compose network."
+            ),
+        ),
+    ] = DEFAULT_WORKER_HOST,
 ) -> None:
     """Run the full Prizmanyx pipeline loop against ENV and report PASS/FAIL.
 
@@ -283,7 +296,7 @@ def run_command(
 
     client = PrizmanyxClient(prizmanyx)
     try:
-        report = run_loop(env, client)
+        report = run_loop(env, client, worker_host=worker_host)
     finally:
         client.close()
 

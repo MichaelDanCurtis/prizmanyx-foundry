@@ -15,11 +15,13 @@ import pytest
 
 from foundry import state
 from foundry.loop import (
+    DEFAULT_WORKER_HOST,
     STEP_ORDER,
     Decision,
     LoopReport,
     StepResult,
     run_loop,
+    worker_reachable_endpoint,
 )
 from foundry.prizmanyx_client import LoopStepError
 from foundry.report import FIDELITY_LINE, load_report, render_markdown, write_report
@@ -190,11 +192,45 @@ def test_happy_path_captures_program_graph_run_units_and_translation_ids():
     assert report.translation_ids == [101, 102]
 
 
-def test_happy_path_registers_the_localhost_endpoint_for_the_envs_own_port():
+def test_happy_path_registers_the_worker_reachable_endpoint_by_default():
+    # Extraction runs as a Temporal ACTIVITY inside the prizmanyx-temporal-
+    # worker container, not the host `uvicorn` process that receives this
+    # registration call - `localhost` from inside that container is the
+    # container itself, unreachable (Task 8 live finding). The default must
+    # be the worker-reachable form, not the host-reachable one.
     client = _FakeClient()
     run_loop(_env(port=15900), client)
 
-    assert client.registered_endpoint_url == "http://localhost:15900"
+    assert client.registered_endpoint_url == "http://host.docker.internal:15900"
+
+
+def test_run_loop_honors_a_worker_host_override():
+    # A Linux host-gateway, or a worker sharing this environment's own
+    # compose network under a service name, would need something other
+    # than Docker Desktop's host.docker.internal.
+    client = _FakeClient()
+    run_loop(_env(port=15900), client, worker_host="172.17.0.1")
+
+    assert client.registered_endpoint_url == "http://172.17.0.1:15900"
+
+
+def test_worker_reachable_endpoint_default_and_override():
+    env = _env(port=15900)
+
+    assert DEFAULT_WORKER_HOST == "host.docker.internal"
+    assert worker_reachable_endpoint(env) == "http://host.docker.internal:15900"
+    assert worker_reachable_endpoint(env, worker_host="my-worker") == "http://my-worker:15900"
+
+
+def test_happy_path_records_the_worker_endpoint_url_on_the_report():
+    client = _FakeClient()
+    report = run_loop(_env(port=15900), client)
+
+    assert report.worker_endpoint_url == "http://host.docker.internal:15900"
+    # It must be exactly what was actually sent to register_env_connection -
+    # never a value the report merely computed independently and hoped
+    # matched.
+    assert report.worker_endpoint_url == client.registered_endpoint_url
 
 
 def test_happy_path_writes_the_export_pack_into_the_envs_directory():
@@ -435,6 +471,11 @@ def test_write_report_produces_a_markdown_file_with_the_fidelity_line_and_verdic
     assert "PASS" in text
     assert "translate" in text  # every step name appears in the steps table
     assert "rehost" in text  # every decision choice appears in the decisions table
+    # The worker-reachable endpoint is distinct from the foundry's own
+    # host-side verification endpoint - the report header must say so, not
+    # just carry the bare URL with no context.
+    assert "http://host.docker.internal:15600" in text
+    assert "localhost" in text
 
 
 def test_write_report_produces_a_markdown_file_naming_the_failed_step():

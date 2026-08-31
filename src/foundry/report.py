@@ -82,6 +82,9 @@ def render_markdown(report: LoopReport) -> str:
     lines += [
         f"- Program id: {report.program_id}",
         f"- Graph run id: {report.graph_run_id}",
+        f"- Worker-reachable AWS endpoint: {report.worker_endpoint_url} (what "
+        "Prizmanyx's extraction worker container connects to - the foundry's own "
+        "host-side verification calls correctly use localhost instead, not this)",
         f"- Migration unit ids: {', '.join(str(i) for i in report.unit_ids) or '(none)'}",
         f"- Translation ids: {', '.join(str(i) for i in report.translation_ids) or '(none)'}",
         f"- Started: {report.started_at.isoformat()}",

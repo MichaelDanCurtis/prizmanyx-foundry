@@ -426,7 +426,7 @@ def test_run_reports_pass_and_exits_zero(monkeypatch):
     monkeypatch.setattr(cli, "env_status", lambda name: _env(name))
     recorded_calls: list[tuple[object, object]] = []
 
-    def _fake_run_loop(env, client):
+    def _fake_run_loop(env, client, **_kwargs):
         recorded_calls.append((env, client))
         return _pass_report(env.name)
 
@@ -462,7 +462,7 @@ def test_run_defaults_to_localhost_8000_and_honors_the_prizmanyx_flag(monkeypatc
             super().__init__(base_url, *args, **kwargs)
 
     monkeypatch.setattr(cli, "PrizmanyxClient", _RecordingClient)
-    monkeypatch.setattr(cli, "run_loop", lambda env, _client: _pass_report(env.name))
+    monkeypatch.setattr(cli, "run_loop", lambda env, _client, **_kwargs: _pass_report(env.name))
 
     runner.invoke(cli.app, ["run", "demo"])
     assert captured_urls == ["http://localhost:8000"]
@@ -471,9 +471,28 @@ def test_run_defaults_to_localhost_8000_and_honors_the_prizmanyx_flag(monkeypatc
     assert captured_urls[-1] == "http://example.test:9000"
 
 
+def test_run_defaults_worker_host_to_host_docker_internal_and_honors_the_override(monkeypatch):
+    monkeypatch.setattr(cli, "env_status", lambda name: _env(name))
+    monkeypatch.setattr(cli, "write_report", lambda _report, directory: (directory, directory))
+    recorded_worker_hosts: list[str] = []
+
+    def _fake_run_loop(env, _client, worker_host="unset"):
+        recorded_worker_hosts.append(worker_host)
+        return _pass_report(env.name)
+
+    monkeypatch.setattr(cli, "run_loop", _fake_run_loop)
+
+    result = runner.invoke(cli.app, ["run", "demo"])
+    assert result.exit_code == 0, result.output
+    assert recorded_worker_hosts == ["host.docker.internal"]
+
+    runner.invoke(cli.app, ["run", "demo", "--worker-host", "172.17.0.1"])
+    assert recorded_worker_hosts[-1] == "172.17.0.1"
+
+
 def test_run_reports_fail_and_exits_nonzero_naming_the_failed_step(monkeypatch):
     monkeypatch.setattr(cli, "env_status", lambda name: _env(name))
-    monkeypatch.setattr(cli, "run_loop", lambda env, _client: _fail_report(env.name))
+    monkeypatch.setattr(cli, "run_loop", lambda env, _client, **_kwargs: _fail_report(env.name))
     monkeypatch.setattr(
         cli, "write_report", lambda _report, directory: (directory / "report.md", directory)
     )
@@ -492,7 +511,9 @@ def test_run_of_an_unknown_environment_fails_with_a_message_and_never_calls_run_
 
     monkeypatch.setattr(cli, "env_status", _boom)
     monkeypatch.setattr(
-        cli, "run_loop", lambda *_: pytest.fail("run_loop must not be called for an unknown env")
+        cli,
+        "run_loop",
+        lambda *_args, **_kwargs: pytest.fail("run_loop must not be called for an unknown env"),
     )
 
     result = runner.invoke(cli.app, ["run", "ghost"])
@@ -515,7 +536,7 @@ def test_run_closes_the_client_even_when_run_loop_raises_unexpectedly(monkeypatc
 
     monkeypatch.setattr(cli, "PrizmanyxClient", _TrackingClient)
 
-    def _boom(_env, _client):
+    def _boom(_env, _client, **_kwargs):
         raise RuntimeError("unexpected bug")
 
     monkeypatch.setattr(cli, "run_loop", _boom)

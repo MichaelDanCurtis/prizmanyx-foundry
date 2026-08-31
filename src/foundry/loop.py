@@ -55,6 +55,24 @@ _T = TypeVar("_T")
 _ACCOUNT_ID = "000000000000"
 _REGION = "us-east-1"
 
+# Extraction runs as a Temporal ACTIVITY inside the prizmanyx-temporal-
+# worker CONTAINER, not in the host `uvicorn` process that merely receives
+# this module's `register_env_connection` call (Task 8 live finding,
+# 2026-08-31: Prizmanyx's own preflight refused a `localhost` endpoint as
+# "unreachable from the discovery worker ... The worker runs in a
+# container, so 'localhost' there is the container itself" - confirmed live
+# with `docker exec prizmanyx-temporal-worker curl
+# http://host.docker.internal:15600/` -> HTTP 200, `host.docker.internal`
+# resolving to the host machine from inside that container). This is the
+# SAME address form `materialize.py`'s own emitted terraform provider
+# already targets, for the identical reason - one environment, one
+# worker-reachable address, no matter which container asks for it.
+# Overridable (see `worker_reachable_endpoint`, `run_loop`'s `worker_host`,
+# and `foundry run --worker-host`) for a non-Docker-Desktop worker: a Linux
+# host would use its own host-gateway address, and a worker joined to this
+# environment's own compose network could use a service name instead.
+DEFAULT_WORKER_HOST = "host.docker.internal"
+
 # app.py's sign_off_store.SIGN_OFF_ROLES required subset for the
 # `client_report` deliverable (see prizmanyx_client.sign_off's own
 # docstring) - all four are mandatory for poll_exit_gate's
@@ -142,6 +160,14 @@ class LoopReport(BaseModel):
     translation-id poll) leaves every entry it genuinely produced before the
     failure in the report - none of these ever collapse to empty just
     because the batch as a whole did not finish.
+
+    `worker_endpoint_url` is the exact value this run sent to
+    `register_env_connection` (see `worker_reachable_endpoint`) - the
+    address Prizmanyx's extraction WORKER container reaches this
+    environment at, deliberately distinct from the `localhost` address the
+    foundry's own host-side boto3 verification calls correctly use instead.
+    Never treat the two as interchangeable just because both name the same
+    environment.
     """
 
     env_name: str
@@ -152,6 +178,7 @@ class LoopReport(BaseModel):
     decisions: list[Decision] = Field(default_factory=list)
     program_id: int | None = None
     graph_run_id: int | None = None
+    worker_endpoint_url: str | None = None
     unit_ids: list[int] = Field(default_factory=list)
     translation_ids: list[int] = Field(default_factory=list)
     artifact_paths: list[str] = Field(default_factory=list)
@@ -250,6 +277,35 @@ def _program_name(env: EnvState) -> str:
     return f"foundry-{env.name}-{stamp}"
 
 
+def worker_reachable_endpoint(env: EnvState, *, worker_host: str = DEFAULT_WORKER_HOST) -> str:
+    """The AWS endpoint URL Prizmanyx's discovery WORKER can actually reach.
+
+    `register_env_connection`'s `endpoint_url` is stored once, then read
+    back later by whatever process performs extraction - and that is a
+    Temporal ACTIVITY running inside the `prizmanyx-temporal-worker`
+    container, never the host `uvicorn` process that merely receives this
+    registration call (see `DEFAULT_WORKER_HOST`'s own comment for the
+    live Task 8 finding that proved this: a `localhost` endpoint was
+    refused by Prizmanyx's own preflight as unreachable from that worker).
+    `host.docker.internal` is Docker Desktop's own name for "the host
+    machine, from inside any container" - the same form
+    `materialize.py`'s emitted terraform provider already uses to reach
+    this same environment, for the identical reason.
+
+    This is deliberately NOT the address the foundry's OWN host-side boto3
+    verification calls should use - those run in the foundry's own Python
+    process, on the host, where `localhost` is correct and
+    `host.docker.internal` would be wrong. Never point boto3 calls at this
+    function's output; it exists for `register_env_connection` only.
+
+    `worker_host` defaults to `DEFAULT_WORKER_HOST` and is the one thing a
+    non-Docker-Desktop worker - a Linux host-gateway address, or a worker
+    joined to this environment's own compose network under a service name -
+    would need to override.
+    """
+    return f"http://{worker_host}:{env.ports['aws']}"
+
+
 def _ensure_pipeline_run_succeeded(row: JSONObject) -> JSONObject:
     """Turn a non-`succeeded` terminal pipeline-run status into a `LoopStepError`.
 
@@ -297,12 +353,18 @@ def run_loop(
     env: EnvState,
     client: PipelineClient,
     *,
+    worker_host: str = DEFAULT_WORKER_HOST,
     translation_poll_max_attempts: int = _TRANSLATION_POLL_MAX_ATTEMPTS,
     translation_poll_interval: float = _TRANSLATION_POLL_INTERVAL_SECONDS,
 ) -> LoopReport:
     """Walk `env`'s estate through Prizmanyx's pipeline via `client`, and
     return a full `LoopReport` - PASS or FAIL, but always a report, never a
-    raised `LoopStepError` (see this module's own docstring for why)."""
+    raised `LoopStepError` (see this module's own docstring for why).
+
+    `worker_host` is passed straight to `worker_reachable_endpoint` for the
+    `register_env_connection` call - see that function's own docstring for
+    why this can't just be `env`'s own `localhost` address.
+    """
     started_at = datetime.now(UTC)
     steps: dict[str, StepResult] = {
         name: StepResult(name=name, status="UNRUN") for name in STEP_ORDER
@@ -310,6 +372,7 @@ def run_loop(
     decisions: list[Decision] = []
     program_id: int | None = None
     graph_run_id: int | None = None
+    worker_endpoint_url: str | None = None
     unit_ids: list[int] = []
     translation_ids: list[int] = []
     artifact_paths: list[str] = []
@@ -347,10 +410,10 @@ def run_loop(
         )
         program_id = program["id"]
 
-        endpoint_url = f"http://localhost:{env.ports['aws']}"
+        worker_endpoint_url = worker_reachable_endpoint(env, worker_host=worker_host)
         _step(
             "register_env_connection",
-            lambda: client.register_env_connection(program_id, endpoint_url),
+            lambda: client.register_env_connection(program_id, worker_endpoint_url),
         )
 
         extraction = _step(
@@ -449,6 +512,7 @@ def run_loop(
         decisions=decisions,
         program_id=program_id,
         graph_run_id=graph_run_id,
+        worker_endpoint_url=worker_endpoint_url,
         unit_ids=unit_ids,
         translation_ids=translation_ids,
         artifact_paths=artifact_paths,
