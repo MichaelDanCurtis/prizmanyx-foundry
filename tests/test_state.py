@@ -15,6 +15,7 @@ import pytest
 
 from foundry import state
 from foundry.state import (
+    CHILD_NAME_PREFIXES,
     ENV_NAME_PATTERN,
     EnvState,
     InvalidEnvNameError,
@@ -114,3 +115,26 @@ def test_validate_env_name_rejects_bad_names_naming_the_rule(name):
 def test_env_dir_validates_the_name_too():
     with pytest.raises(InvalidEnvNameError):
         state.env_dir("Bad!")
+
+
+# --- env name / child-prefix collision rejection --------------------------
+# A fix-round review reproduced a live bug: an env named e.g. "rds-x" gets
+# container "floci-rds-x", which starts with "floci-rds-" (a
+# CHILD_NAME_PREFIXES entry) purely by coincidence of the `floci-<name>`
+# join - engine.py's reap sweep then cannot tell that live parent container
+# apart from a real emulated-RDS child by name alone. Reject the name
+# shape at the boundary so this collision can never be created.
+
+
+@pytest.mark.parametrize("stem", [prefix.removeprefix("floci-") for prefix in CHILD_NAME_PREFIXES])
+def test_validate_env_name_rejects_names_colliding_with_child_prefixes(stem):
+    colliding_name = f"{stem}x"
+    with pytest.raises(InvalidEnvNameError, match=re.escape(stem)):
+        validate_env_name(colliding_name)
+
+
+def test_validate_env_name_accepts_a_name_that_merely_contains_a_stem_mid_string():
+    # The rule is "starts with", not "contains" - a stem appearing after
+    # the first character is not a collision (floci-my-rds-clone does not
+    # start with floci-rds-).
+    validate_env_name("my-rds-clone")  # must not raise

@@ -28,16 +28,51 @@ from pydantic import BaseModel
 ENV_NAME_PATTERN = r"^[a-z][a-z0-9-]{0,40}$"
 _ENV_NAME_RE = re.compile(ENV_NAME_PATTERN)
 
+# Floci's real-engine services (RDS, EC2, ElastiCache) back their emulated
+# resources with their own containers, named after the resource's own
+# identifier, that survive `docker rm` of the floci parent (spike-proven,
+# 2026-08-30: `floci-rds-db-*` and `floci-ec2-i-*` both survived teardown as
+# running orphans - see engine.py's `select_children_to_reap`, the actual
+# consumer of this list for its reap sweep).
+#
+# Defined HERE rather than in engine.py because this module's own name
+# validation must know it too: an environment named e.g. `rds-x` would get
+# a parent container `floci-rds-x` that collides with `floci-rds-` by pure
+# coincidence of the `floci-<name>` join, and engine.py's reap sweep would
+# then have no way to tell that live parent container apart from a real
+# emulated-RDS child by name alone (this is exactly how a real bug shipped:
+# a fix-round review reproduced a peer environment's own parent container
+# being reaped because of this collision). One list, so the reap patterns
+# and the naming rule that avoids colliding with them can never drift
+# apart.
+CHILD_NAME_PREFIXES: tuple[str, ...] = ("floci-rds-", "floci-ec2-", "floci-elasticache-")
+
+# Every entry above is "floci-" + a stem (e.g. "rds-"). Derived, not
+# hand-duplicated, so this and CHILD_NAME_PREFIXES can never drift apart.
+_CHILD_PREFIX_STEMS: tuple[str, ...] = tuple(
+    prefix.removeprefix("floci-") for prefix in CHILD_NAME_PREFIXES
+)
+
 FOUNDRY_HOME = Path.home() / ".prizmanyx-foundry"
 ENVS_DIR = FOUNDRY_HOME / "envs"
 
 
 class InvalidEnvNameError(ValueError):
-    """Raised when a candidate environment name does not match ENV_NAME_PATTERN."""
+    """Raised when a candidate environment name does not match ENV_NAME_PATTERN
+    or would collide with floci's own child-container naming."""
 
 
 def validate_env_name(name: str) -> None:
-    """Raise InvalidEnvNameError if `name` does not match ENV_NAME_PATTERN.
+    """Raise InvalidEnvNameError if `name` is not a safe environment name.
+
+    Two independent checks: `name` must match ENV_NAME_PATTERN, AND `name`
+    must not start with a CHILD_NAME_PREFIXES stem (e.g. `rds-`) - otherwise
+    `floci-<name>` (this environment's own parent container) would be
+    indistinguishable by name from one of floci's emulated-resource child
+    containers, and engine.py's child-reap sweep could mistake a live
+    peer's parent container for an orphan (see CHILD_NAME_PREFIXES's own
+    comment, and `engine.select_children_to_reap`'s docstring, for exactly
+    what that costs).
 
     Called from `engine.create_env` before anything else happens (fail
     fast, before a port is allocated or a container started) and again
@@ -48,6 +83,13 @@ def validate_env_name(name: str) -> None:
     if not _ENV_NAME_RE.fullmatch(name):
         raise InvalidEnvNameError(
             f"invalid environment name {name!r}: must match {ENV_NAME_PATTERN}"
+        )
+    if name.startswith(_CHILD_PREFIX_STEMS):
+        raise InvalidEnvNameError(
+            f"invalid environment name {name!r}: must not start with any of "
+            f"{_CHILD_PREFIX_STEMS!r} (floci-{name} would collide with floci's own "
+            "child-container naming - CHILD_NAME_PREFIXES - and could be mistaken for "
+            "an emulated resource's backing container when a peer environment is removed)"
         )
 
 
@@ -72,6 +114,18 @@ class EnvState(BaseModel):
     the caller's original file, so the environment's record stays
     self-contained even if the caller's original spec file later moves or
     changes.
+
+    `created_at` is stamped by `create_env` AFTER the container reports
+    healthy, not at the moment `docker run` was issued - it can trail the
+    container's own `docker ps`/`docker inspect` creation timestamp by
+    however long the healthcheck took (seconds to tens of seconds).
+    Anything that compares this field against a `docker ps` CreatedAt value
+    (engine.py's reap sweep does exactly that) must not assume the two
+    clocks agree to the second - a fix-round review reproduced a live
+    environment's own parent container being reaped precisely because a
+    timing comparison assumed they did. Treat the two as "this
+    environment's own recorded existence" versus "this container's own
+    recorded existence", never as interchangeable.
     """
 
     name: str

@@ -6,6 +6,13 @@ between this module and the real `docker` binary (subprocess) - so tests
 can monkeypatch a single call instead of shelling out for real. The one
 genuinely pure piece, `select_children_to_reap`, does not even need that
 seam: it takes already-parsed rows and decides, with no I/O of its own.
+
+`list_envs` here returns state only - nobody has asked docker anything.
+Handoff note for whichever task builds `foundry ls`: get live status per
+environment by calling `env_status(name)` for each name `list_envs()`
+returns, one docker round trip per environment - there is no bulk
+"status of everything" call, and `list_envs()`'s own `.status` field is
+whatever was last persisted, not necessarily current.
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ import yaml
 
 from foundry import state
 from foundry.envspec import EnvSpec
-from foundry.state import EnvState
+from foundry.state import CHILD_NAME_PREFIXES, EnvState
 
 # Global Constraints: the spike-validated digest, overridable only through
 # this named escape hatch - never trust an unpinned `floci/floci:latest`.
@@ -38,12 +45,12 @@ PORT_RANGE_END = 16000  # exclusive; the allocatable range is [15600, 15999]
 HEALTHY_TIMEOUT_SECONDS = 60.0
 HEALTH_POLL_INTERVAL_SECONDS = 1.0
 
-# Floci's real-engine services back RDS/EC2/ElastiCache with their own
-# containers that outlive `docker rm` of the floci parent - spike-proven,
-# 2026-08-30: `floci-rds-db-*` and `floci-ec2-i-*` both survived teardown as
-# running orphans. Prefix-matched, not exact: floci names each child after
-# the emulated resource's own identifier, which this list can't predict.
-CHILD_NAME_PREFIXES: tuple[str, ...] = ("floci-rds-", "floci-ec2-", "floci-elasticache-")
+# run_docker's default timeout: fits ps/inspect/rm, local daemon calls with
+# no network I/O. `docker run` gets its own, much larger, timeout - see
+# DOCKER_RUN_TIMEOUT_SECONDS - because it blocks on pulling the image on a
+# cold machine, which a 30s timeout would fail spuriously.
+DOCKER_QUICK_TIMEOUT_SECONDS = 30.0
+DOCKER_RUN_TIMEOUT_SECONDS = 300.0
 
 
 class EngineError(Exception):
@@ -63,7 +70,7 @@ class EnvStartError(EngineError):
 
 
 def run_docker(
-    args: list[str], *, timeout: float | None = 300.0
+    args: list[str], *, timeout: float | None = DOCKER_QUICK_TIMEOUT_SECONDS
 ) -> subprocess.CompletedProcess[str]:
     """Run the `docker` CLI with `args`, capturing stdout/stderr as text.
 
@@ -74,11 +81,9 @@ def run_docker(
     failure means for them (a missing container is a normal outcome for
     some callers, a fatal one for others).
 
-    The default timeout is generous (5 minutes), not snappy, because
-    `docker run` on a cold machine blocks on pulling the image first - a
-    tight timeout here would fail a plain first-ever `create_env` on a slow
-    connection. It still exists to catch a genuinely wedged daemon rather
-    than hanging forever.
+    The default timeout (`DOCKER_QUICK_TIMEOUT_SECONDS`) fits ps/inspect/rm.
+    `docker run` passes its own, much larger, `DOCKER_RUN_TIMEOUT_SECONDS`
+    explicitly - see that constant for why.
     """
     return subprocess.run(
         ["docker", *args], capture_output=True, text=True, check=False, timeout=timeout
@@ -158,17 +163,24 @@ def create_env(name: str, spec: EnvSpec, *, seed: int | None = None) -> EnvState
     """Bring up a new Floci-backed environment and record it.
 
     Order matters for cleanliness on failure: validate the name (cheapest,
-    fails before touching anything), check no environment of this name is
-    already tracked, allocate a port, start the container, wait for it to
-    report healthy, and only once all of that has succeeded, write the spec
-    copy and state.json. A failure at any docker step removes the container
-    it just started before raising - nothing left running, and nothing for
-    `list_envs`/`remove_env` to find, so a retry under the same name starts
-    clean rather than tripping over a failed attempt's leftovers.
+    fails before touching anything - this also rejects a name that would
+    collide with CHILD_NAME_PREFIXES; see `state.validate_env_name`), check
+    no environment of this name is already tracked, allocate a port, start
+    the container, wait for it to report healthy, and only once all of
+    that has succeeded, write the spec copy and state.json. A failure at
+    any docker step removes the container it just started before raising -
+    nothing left running, and nothing for `list_envs`/`remove_env` to find,
+    so a retry under the same name starts clean rather than tripping over a
+    failed attempt's leftovers.
 
     `seed` is recorded on EnvState verbatim when the caller generated
     `spec` via `random_spec` and wants that traceable; hand-written or
     from-repo specs have none.
+
+    NOTE on `created_at`: it is stamped here, after `_wait_healthy`
+    returns - not at the moment `docker run` was issued. See EnvState's
+    own docstring for why that gap matters to anything comparing it
+    against a `docker ps` timestamp.
     """
     state.validate_env_name(name)
     if state.state_file(name).is_file():
@@ -195,7 +207,8 @@ def create_env(name: str, spec: EnvSpec, *, seed: int | None = None) -> EnvState
             "-v",
             "/var/run/docker.sock:/var/run/docker.sock",
             floci_image(),
-        ]
+        ],
+        timeout=DOCKER_RUN_TIMEOUT_SECONDS,
     )
     if run_result.returncode != 0:
         run_docker(["rm", "-f", container])  # best-effort: clear any partial container object.
@@ -243,7 +256,11 @@ def env_status(name: str) -> EnvState:
 
 
 def list_envs() -> list[EnvState]:
-    """Every environment currently tracked (state-only; does not probe docker)."""
+    """Every environment currently tracked (state-only; does not probe docker).
+
+    See this module's own docstring for the `foundry ls` handoff note on
+    getting live status per environment.
+    """
     return state.list_envs()
 
 
@@ -260,6 +277,34 @@ class ContainerRow:
     created_at: datetime
 
 
+@dataclass(frozen=True)
+class ReapSelection:
+    """The verdict of one child-reap sweep: which floci-child-prefixed rows
+    to reap, and which to spare (see `select_children_to_reap`)."""
+
+    reap: list[ContainerRow]
+    spare: list[ContainerRow]
+
+
+@dataclass(frozen=True)
+class RemovalReport:
+    """What `remove_env` actually did to `name`'s containers, by name.
+
+    `reaped` - orphaned floci-child containers it removed. `spared` -
+    floci-child-prefixed containers it saw and deliberately left alone:
+    they might belong to another live environment, they predate `target`,
+    or one literally IS another tracked environment's own parent container
+    (see `select_children_to_reap`'s docstring for exactly which). `unparsed`
+    - `docker ps` rows whose CreatedAt this engine could not parse at all;
+    left untouched rather than guessed at (see `_parse_docker_ps_output`).
+    Every list here holds container names, not environment names.
+    """
+
+    reaped: list[str]
+    spared: list[str]
+    unparsed: list[str]
+
+
 def _is_floci_child(name: str) -> bool:
     return name.startswith(CHILD_NAME_PREFIXES)
 
@@ -268,44 +313,75 @@ def select_children_to_reap(
     candidates: Iterable[ContainerRow],
     target: EnvState,
     other_live_envs: Iterable[EnvState],
-) -> list[ContainerRow]:
-    """Which rows in `candidates` are `target`'s orphaned floci children.
+) -> ReapSelection:
+    """Classify every floci-child-prefixed row in `candidates` as `target`'s
+    to reap, or one to spare. Rows that don't match a child prefix at all
+    (the untouchable compose stack, unrelated containers) are ignored
+    entirely - neither reaped nor reported as spared.
 
-    A row is reaped only if all three hold:
+    A prefix-matching row is REAPED only if ALL of:
 
-    1. Its name matches a floci child-name prefix (`CHILD_NAME_PREFIXES`) -
-       `docker ps -a` lists every container on the host, including the
-       untouchable compose stack, so this is the first gate.
+    1. Its name is not literally another tracked environment's own parent
+       container (`floci-<other.name>` for some `other` in
+       `other_live_envs`) - checked first, unconditionally, regardless of
+       any timestamp. An environment whose NAME happens to start with a
+       child stem (e.g. an env named `rds-x`, container `floci-rds-x`)
+       collides with CHILD_NAME_PREFIXES by construction of the
+       `floci-<name>` join. `state.validate_env_name` now refuses to
+       create such a name, but this check is the second, clock-independent
+       line of defense: it protects a live peer's own parent container
+       even if one exists anyway (a legacy environment from before this
+       validation existed, for instance) - and it is NOT redundant with
+       rule 3 below: `EnvState.created_at` is stamped after that
+       environment's own healthcheck passes (see EnvState's docstring),
+       which can be LATER than that same environment's container's own
+       `docker ps` CreatedAt, so a timing comparison against a peer's own
+       row can come out backwards. Only this unconditional name check
+       catches that case.
     2. It was created after `target.created_at` - a child can't belong to
        an environment that didn't exist yet.
-    3. No OTHER live environment came into existence in the window between
-       `target`'s creation and the row's. If one did, that environment (not
-       `target`) is the more recently created candidate parent, and
-       reaping the row would reach into a still-running environment's real
-       resource. `other_live_envs` may include `target` itself (callers are
-       not required to filter it out first) - it is always excluded here.
+    3. NO other live environment's `created_at` is earlier than the row's.
 
-    There is no docker label tying a child back to the specific floci
-    parent that spawned it (checked directly against the spike's own
-    `docker inspect` transcripts - floci sets none), so "created after the
-    nearest still-live environment before it" is the best attribution
-    available from `docker ps` output alone. It is exact whenever
-    environments are created and removed one at a time, which is this
-    tool's normal usage pattern; the failure mode when environments overlap
-    in unusual ways is to under-reap (leave an orphan behind) rather than
-    to ever delete a live environment's resource.
+    Rule 3 is deliberately NOT "no other env came into existence between
+    target and the row" - an earlier version of this function got exactly
+    that wrong: it only excluded LATER-created environments from
+    consideration, so an OLDER live environment was never treated as a
+    candidate parent, and a peer's `remove_env` could reap that older
+    environment's own still-being-spawned child right out from under it.
+    The corrected rule's honest cost: once two or more environments are
+    alive, a row created after `target` is spared the instant ANY other
+    live environment predates it - in normal use, where environments are
+    created one at a time, that is every other live environment, so
+    nothing auto-reaps while 2+ environments are alive and any of them is
+    older than the row. That conservatism is the point: there is no docker
+    label tying a child back to the specific floci parent that spawned it
+    (checked directly against the spike's own `docker inspect`
+    transcripts - floci sets none), so reaping a live environment's real
+    resource - not leaving an orphan a human (or a future prune command)
+    can clean up later - is the failure this function exists to prevent.
+    Spared rows are never deleted automatically, here or anywhere else;
+    `remove_env` reports them (`RemovalReport.spared`) rather than acting
+    on them.
     """
     other_live = [env for env in other_live_envs if env.name != target.name]
-    reap = []
+    other_parent_names = {container_name(env.name) for env in other_live}
+
+    reap: list[ContainerRow] = []
+    spare: list[ContainerRow] = []
     for row in candidates:
         if not _is_floci_child(row.name):
             continue
-        if row.created_at <= target.created_at:
+        if row.name in other_parent_names:
+            spare.append(row)
             continue
-        if any(target.created_at < other.created_at <= row.created_at for other in other_live):
+        if row.created_at <= target.created_at:
+            spare.append(row)
+            continue
+        if any(other.created_at < row.created_at for other in other_live):
+            spare.append(row)
             continue
         reap.append(row)
-    return reap
+    return ReapSelection(reap=reap, spare=spare)
 
 
 _DOCKER_PS_FORMAT = "{{.Names}}\t{{.CreatedAt}}"
@@ -320,30 +396,60 @@ _DOCKER_CREATED_AT_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) ([+-
 
 
 def _parse_docker_created_at(raw: str) -> datetime:
-    """Parse one `docker ps --format '{{.CreatedAt}}'` value into an aware datetime."""
+    """Parse one `docker ps --format '{{.CreatedAt}}'` value into an aware datetime.
+
+    Raises ValueError if `raw` does not match the expected layout;
+    `_parse_docker_ps_output` catches this per-line rather than letting one
+    malformed row abort parsing every other one.
+    """
     match = _DOCKER_CREATED_AT_RE.match(raw.strip())
     if not match:
         raise ValueError(f"unparseable docker ps CreatedAt: {raw!r}")
     return datetime.strptime(f"{match.group(1)} {match.group(2)}", "%Y-%m-%d %H:%M:%S %z")
 
 
-def _list_floci_containers() -> list[ContainerRow]:
-    """`docker ps -a` rows for every container whose name starts with
-    `floci-` - a superset of both env parents and their children;
-    `select_children_to_reap` does the precise filtering."""
-    result = run_docker(["ps", "-a", "--filter", "name=floci-", "--format", _DOCKER_PS_FORMAT])
-    rows = []
-    for line in result.stdout.splitlines():
+def _parse_docker_ps_output(stdout: str) -> tuple[list[ContainerRow], list[str]]:
+    r"""Parse `docker ps --format '{{.Names}}\t{{.CreatedAt}}'` stdout into
+    rows, tolerating unparseable lines instead of raising.
+
+    A line missing the tab separator, or whose CreatedAt half doesn't match
+    docker's own layout, is skipped, and its best-effort name (the text
+    before the first tab, or the whole line if there is no tab at all) goes
+    into the second return value instead of raising - one malformed row
+    must never block `remove_env` from reaping every other one, or from
+    completing at all.
+    """
+    rows: list[ContainerRow] = []
+    unparsed: list[str] = []
+    for line in stdout.splitlines():
         if not line.strip():
             continue
-        raw_name, _, raw_created = line.partition("\t")
-        rows.append(ContainerRow(name=raw_name, created_at=_parse_docker_created_at(raw_created)))
-    return rows
+        raw_name, separator, raw_created = line.partition("\t")
+        if not separator:
+            unparsed.append(line.strip())
+            continue
+        try:
+            created_at = _parse_docker_created_at(raw_created)
+        except ValueError:
+            unparsed.append(raw_name.strip() or line.strip())
+            continue
+        rows.append(ContainerRow(name=raw_name.strip(), created_at=created_at))
+    return rows, unparsed
 
 
-def remove_env(name: str) -> None:
-    """Tear down environment `name` completely: parent container, every
-    orphaned child it spawned, and its on-disk state.
+def _list_floci_containers() -> tuple[list[ContainerRow], list[str]]:
+    """`docker ps -a` rows for every container whose name starts with
+    `floci-` - a superset of both env parents and their children;
+    `select_children_to_reap` does the precise filtering. Second element:
+    unparsed row names - see `_parse_docker_ps_output`."""
+    result = run_docker(["ps", "-a", "--filter", "name=floci-", "--format", _DOCKER_PS_FORMAT])
+    return _parse_docker_ps_output(result.stdout)
+
+
+def remove_env(name: str) -> RemovalReport:
+    """Tear down environment `name`: its parent container, every floci-
+    child container this engine can safely attribute to it, and its
+    on-disk state - and report exactly what happened.
 
     Order: remove the parent first (fast, always safe, best-effort - an
     already-gone parent is not fatal), THEN sweep for surviving children
@@ -353,6 +459,19 @@ def remove_env(name: str) -> None:
     a retry able to pick up whatever this call did not finish, rather than
     an environment that vanished from tracking while containers of its own
     were still running.
+
+    This does NOT promise "reaps every orphan and nothing else" - that was
+    an earlier, false claim this docstring made, and a fix-round review
+    reproduced two ways it broke (an older live environment's child reaped
+    by a younger peer's removal; a live peer's own parent container reaped
+    outright when its name happened to collide with CHILD_NAME_PREFIXES).
+    The true, narrower guarantee `select_children_to_reap` actually
+    provides: this never reaps a container it cannot confidently attribute
+    to `name` alone. Ambiguous rows survive as `RemovalReport.spared` for a
+    human (or a future prune command) to act on, rather than being guessed
+    at and possibly torn out from under a still-live peer environment.
+    Rows this engine could not even parse survive as `RemovalReport.unparsed`
+    for the same reason - never touched, never guessed at.
     """
     try:
         target = state.load_state(name)
@@ -364,7 +483,15 @@ def remove_env(name: str) -> None:
     # Includes `target` itself (its state.json is not deleted yet) -
     # select_children_to_reap excludes it from "other" on its own.
     other_live = state.list_envs()
-    for row in select_children_to_reap(_list_floci_containers(), target, other_live):
+    candidates, unparsed = _list_floci_containers()
+    selection = select_children_to_reap(candidates, target, other_live)
+    for row in selection.reap:
         run_docker(["rm", "-f", row.name])
 
     state.delete_env_dir(name)
+
+    return RemovalReport(
+        reaped=[row.name for row in selection.reap],
+        spared=[row.name for row in selection.spare],
+        unparsed=unparsed,
+    )

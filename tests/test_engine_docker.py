@@ -2,13 +2,25 @@
 child-reap selection logic.
 
 Pure tests (name-validation propagation, port allocation, child-reap
-selection) always run - no docker daemon involved, nothing here shells out.
-The single @pytest.mark.docker test at the bottom exercises the real
-lifecycle against a real container and is skipped cleanly (conftest.py)
-when no docker daemon is reachable.
+selection, transcript parsing) always run - no docker daemon involved,
+nothing here shells out. The single @pytest.mark.docker test at the bottom
+exercises the real lifecycle against a real container and is skipped
+cleanly (conftest.py) when no docker daemon is reachable.
 
-Written before src/foundry/engine.py exists - the whole module import fails
-until that file lands (the TDD red step for this task).
+The "case A2" and "case B" tests below reproduce two real bugs a fix-round
+review found in an earlier version of `select_children_to_reap`:
+
+  A2: rule 3 only excluded LATER-created environments from being a
+      candidate parent, so an OLDER live environment's own child was
+      wrongly reaped by a younger peer's `remove_env`.
+  B:  an environment named e.g. "rds-x" gets container "floci-rds-x",
+      which collides with CHILD_NAME_PREFIXES by coincidence of the
+      `floci-<name>` join; combined with EnvState.created_at being
+      stamped AFTER that environment's own healthcheck (later than the
+      same container's real `docker ps` CreatedAt), a peer's removal
+      could reap that live environment's own parent container outright.
+
+Both are asserted here as "spared, not reaped" - the corrected behavior.
 """
 
 from __future__ import annotations
@@ -20,10 +32,12 @@ from pathlib import Path
 
 import pytest
 
+from foundry import state
 from foundry.engine import (
     PORT_RANGE_END,
     PORT_RANGE_START,
     ContainerRow,
+    _parse_docker_ps_output,
     allocate_port,
     container_name,
     create_env,
@@ -62,6 +76,16 @@ def test_create_env_rejects_a_bad_name_without_calling_docker(monkeypatch):
         create_env("Foo!", EnvSpec(name_prefix="demo"))
 
 
+def test_create_env_rejects_a_child_prefix_colliding_name_without_calling_docker(monkeypatch):
+    def _must_not_be_called(args: list[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"run_docker should not be called, got {args!r}")
+
+    monkeypatch.setattr("foundry.engine.run_docker", _must_not_be_called)
+
+    with pytest.raises(InvalidEnvNameError):
+        create_env("rds-evil", EnvSpec(name_prefix="demo"))
+
+
 # --- allocate_port -----------------------------------------------------------
 
 
@@ -77,7 +101,7 @@ def test_allocate_port_skips_a_port_that_is_already_bound():
     assert PORT_RANGE_START <= port < PORT_RANGE_END
 
 
-# --- select_children_to_reap -------------------------------------------------
+# --- select_children_to_reap: baseline behavior ------------------------------
 
 
 def test_select_children_to_reap_reaps_orphans_spares_others_ignores_unrelated():
@@ -93,12 +117,16 @@ def test_select_children_to_reap_reaps_orphans_spares_others_ignores_unrelated()
         _row("floci-target", t0 + timedelta(minutes=1)),  # the parent itself -> ignore
     ]
 
-    reaped = {row.name for row in select_children_to_reap(candidates, target, [target, other])}
+    selection = select_children_to_reap(candidates, target, [target, other])
 
-    assert reaped == {"floci-ec2-i-orphan1", "floci-rds-db-orphan2-abcd"}
+    assert {row.name for row in selection.reap} == {
+        "floci-ec2-i-orphan1",
+        "floci-rds-db-orphan2-abcd",
+    }
+    assert {row.name for row in selection.spare} == {"floci-ec2-i-belongs-to-other"}
 
 
-def test_select_children_to_reap_excludes_children_created_at_or_before_target():
+def test_select_children_to_reap_spares_children_created_at_or_before_target():
     t0 = datetime(2026, 1, 1, tzinfo=UTC)
     target = _env("target", t0)
     candidates = [
@@ -106,31 +134,63 @@ def test_select_children_to_reap_excludes_children_created_at_or_before_target()
         _row("floci-ec2-i-before", t0 - timedelta(seconds=1)),
     ]
 
-    assert select_children_to_reap(candidates, target, [target]) == []
+    selection = select_children_to_reap(candidates, target, [target])
+
+    assert selection.reap == []
+    assert {row.name for row in selection.spare} == {
+        "floci-ec2-i-same-instant",
+        "floci-ec2-i-before",
+    }
 
 
-def test_select_children_to_reap_treats_a_child_at_the_other_envs_exact_creation_as_owned():
-    # Boundary case for rule 3: the row's created_at is exactly equal to
-    # the other env's created_at, not strictly after it - still "owned by
-    # the other env" (the <= in the ownership window), because the other
-    # env already existed at that instant and could have spawned it.
+def test_select_children_to_reap_spares_a_child_created_a_moment_after_another_live_env():
+    # The mandated rule is a strict "<": `other.created_at < row.created_at`.
+    # One microsecond after `other` came into existence is enough for
+    # `other` to be an equally plausible parent - spared.
     t0 = datetime(2026, 1, 1, tzinfo=UTC)
     target = _env("target", t0)
     other = _env("other", t0 + timedelta(minutes=1))
-    candidates = [_row("floci-ec2-i-exact", other.created_at)]
+    candidates = [_row("floci-ec2-i-just-after", other.created_at + timedelta(microseconds=1))]
 
-    assert select_children_to_reap(candidates, target, [target, other]) == []
+    selection = select_children_to_reap(candidates, target, [target, other])
+
+    assert selection.reap == []
+    assert [row.name for row in selection.spare] == ["floci-ec2-i-just-after"]
+
+
+def test_select_children_to_reap_reaps_a_child_at_the_exact_same_instant_as_another_env():
+    # The flip side of the strict "<": a row created at the EXACT same
+    # instant as `other` does not satisfy `other.created_at <
+    # row.created_at` (equal is not less), so rule 3 alone does not spare
+    # it - documented explicitly here rather than left as an untested
+    # boundary, per the mandated formula verbatim. In real usage this is a
+    # vanishingly unlikely tie (docker's own CreatedAt has only
+    # whole-second resolution, EnvState.created_at has microsecond
+    # resolution), not a live risk.
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    target = _env("target", t0)
+    other = _env("other", t0 + timedelta(minutes=1))
+    candidates = [_row("floci-ec2-i-exact-tie", other.created_at)]
+
+    selection = select_children_to_reap(candidates, target, [target, other])
+
+    assert [row.name for row in selection.reap] == ["floci-ec2-i-exact-tie"]
+    assert selection.spare == []
 
 
 def test_select_children_to_reap_never_matches_a_name_outside_the_child_prefixes():
     # Lambda is one of floci's real-engine services per the README, but the
     # plan's CHILD_NAME_PREFIXES deliberately names only rds/ec2/elasticache
-    # - a plausible-looking "floci-lambda-..." name must still be ignored.
+    # - a plausible-looking "floci-lambda-..." name must still be ignored
+    # entirely (neither reaped nor reported as spared).
     t0 = datetime(2026, 1, 1, tzinfo=UTC)
     target = _env("target", t0)
     candidates = [_row("floci-lambda-fn-abc", t0 + timedelta(minutes=1))]
 
-    assert select_children_to_reap(candidates, target, [target]) == []
+    selection = select_children_to_reap(candidates, target, [target])
+
+    assert selection.reap == []
+    assert selection.spare == []
 
 
 def test_select_children_to_reap_ignores_target_appearing_in_other_live_envs():
@@ -141,9 +201,118 @@ def test_select_children_to_reap_ignores_target_appearing_in_other_live_envs():
     target = _env("target", t0)
     candidates = [_row("floci-ec2-i-orphan", t0 + timedelta(minutes=1))]
 
-    reaped = select_children_to_reap(candidates, target, [target])
+    selection = select_children_to_reap(candidates, target, [target])
 
-    assert [row.name for row in reaped] == ["floci-ec2-i-orphan"]
+    assert [row.name for row in selection.reap] == ["floci-ec2-i-orphan"]
+    assert selection.spare == []
+
+
+# --- select_children_to_reap: fix-round bug reproductions -------------------
+
+
+def test_select_children_to_reap_spares_an_older_live_envs_child_case_a2():
+    # Case A2: env "a" is OLDER than target and still alive. A child
+    # spawned by "a" AFTER target was created (a is still receiving
+    # traffic well after a younger peer exists) must never be reaped just
+    # because removing the younger peer ("target") is what triggered the
+    # sweep. The buggy rule (`target.created_at < other.created_at <=
+    # row.created_at`) required the "other" env to be created AFTER
+    # target, so an older "a" was never even considered a candidate parent
+    # and this row was wrongly reaped.
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    older_live_env = _env("a", t0)
+    target = _env("target", t0 + timedelta(minutes=5))
+    a_child = _row("floci-ec2-i-belongs-to-a", t0 + timedelta(minutes=10))
+
+    selection = select_children_to_reap([a_child], target, [target, older_live_env])
+
+    assert selection.reap == [], "an older live env's child must never be reaped"
+    assert [row.name for row in selection.spare] == ["floci-ec2-i-belongs-to-a"]
+
+
+def test_select_children_to_reap_spares_a_peer_whose_name_collides_with_child_prefix_case_b():
+    # Case B: env "rds-x" is a live peer whose OWN parent container is
+    # named "floci-rds-x" - which starts with "floci-rds-" and therefore
+    # matches CHILD_NAME_PREFIXES purely by coincidence of the
+    # `floci-<name>` join. Its EnvState.created_at is stamped AFTER its
+    # own healthcheck passed (see EnvState's docstring) - LATER than that
+    # same container's real `docker ps` CreatedAt - so a timing-only rule
+    # can come out backwards comparing an env against its own container.
+    # Only the unconditional "is this literally another tracked env's
+    # parent container" check (rule 1) catches this; it must never depend
+    # on clocks agreeing.
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    target = _env("target", t0)
+    rds_x_real_docker_created_at = t0 + timedelta(seconds=10)
+    rds_x_recorded_created_at = t0 + timedelta(seconds=40)  # +30s health-wait gap
+    rds_x = _env("rds-x", rds_x_recorded_created_at)
+    rds_x_own_parent_row = _row(container_name("rds-x"), rds_x_real_docker_created_at)
+    assert rds_x_own_parent_row.name.startswith("floci-rds-"), "the collision this test exercises"
+
+    selection = select_children_to_reap([rds_x_own_parent_row], target, [target, rds_x])
+
+    assert selection.reap == [], "a live peer's own parent container must never be reaped"
+    assert [row.name for row in selection.spare] == ["floci-rds-x"]
+
+
+def test_select_children_to_reap_auto_reaps_nothing_once_two_environments_are_alive():
+    # The honest cost of the case-A2 fix, made explicit: with target plus
+    # one OTHER live environment (regardless of which is older), every row
+    # created after target is spared rather than reaped, because the other
+    # env is an equally plausible parent and there is no label to tell
+    # them apart.
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    target = _env("target", t0 + timedelta(minutes=5))
+    older_peer = _env("older-peer", t0)
+    younger_peer = _env("younger-peer", t0 + timedelta(minutes=6))
+    candidates = [_row("floci-ec2-i-ambiguous", t0 + timedelta(minutes=7))]
+
+    with_older = select_children_to_reap(candidates, target, [target, older_peer])
+    with_younger = select_children_to_reap(candidates, target, [target, younger_peer])
+
+    assert with_older.reap == []
+    assert with_younger.reap == []
+
+
+# --- docker ps transcript parsing (real STDOUT shape, tolerant of junk) -----
+
+
+def test_parse_docker_ps_output_parses_well_formed_rows():
+    stdout = (
+        "floci-ec2-i-abc\t2026-01-01 00:05:00 -0700 PDT\n"
+        "floci-rds-db-xyz-1234\t2026-01-01 00:06:00 +0000 UTC\n"
+    )
+
+    rows, unparsed = _parse_docker_ps_output(stdout)
+
+    assert [row.name for row in rows] == ["floci-ec2-i-abc", "floci-rds-db-xyz-1234"]
+    assert unparsed == []
+
+
+def test_parse_docker_ps_output_skips_unparseable_rows_without_raising():
+    stdout = (
+        "floci-ec2-i-good\t2026-01-01 00:05:00 -0700 PDT\n"
+        "floci-ec2-i-garbled\tnot-a-timestamp-at-all\n"
+        "floci-ec2-i-blank-created-at\t\n"
+        "no-tab-in-this-line-at-all\n"
+        "\n"
+        "floci-rds-db-good\t2026-01-01 00:06:00 +0000 UTC\n"
+    )
+
+    rows, unparsed = _parse_docker_ps_output(stdout)
+
+    assert [row.name for row in rows] == ["floci-ec2-i-good", "floci-rds-db-good"]
+    assert unparsed == [
+        "floci-ec2-i-garbled",
+        "floci-ec2-i-blank-created-at",
+        "no-tab-in-this-line-at-all",
+    ]
+
+
+def test_parse_docker_ps_output_handles_empty_stdout():
+    rows, unparsed = _parse_docker_ps_output("")
+    assert rows == []
+    assert unparsed == []
 
 
 # --- docker integration -------------------------------------------------
@@ -163,6 +332,13 @@ def _docker_ps_names(filter_name: str) -> list[str]:
 
 @pytest.mark.docker
 def test_create_status_remove_round_trip_leaves_no_containers_behind():
+    # Deliberately uses the REAL ~/.prizmanyx-foundry (not a monkeypatched
+    # ENVS_DIR): this is the one test that exercises real cross-process
+    # visibility semantics (an env's own state must be visible to any
+    # OTHER real foundry process's "other live envs" check), which an
+    # isolated tmp_path would silently hide. Full cleanup in `finally`
+    # instead - both the container AND the state directory, so a failed
+    # run can never wedge a later run under the same name.
     spec = EnvSpec(name_prefix="t3-engine-test")
     try:
         created = create_env(ENV_NAME, spec)
@@ -172,15 +348,18 @@ def test_create_status_remove_round_trip_leaves_no_containers_behind():
         status = env_status(ENV_NAME)
         assert status.status == "healthy"
 
-        remove_env(ENV_NAME)
+        report = remove_env(ENV_NAME)
+        assert report.reaped == []  # no terraform apply in this task - nothing to have spawned
     finally:
         # Belt and suspenders: if create_env or an assertion above raised
-        # partway through, fall back to a raw docker rm so this test never
-        # leaks a container regardless of what foundry code did or didn't
+        # partway through, fall back to raw docker + filesystem cleanup so
+        # this test can never leak a container OR wedge a later run with a
+        # stale state.json, regardless of what foundry code did or didn't
         # get to run. Never touches the untouchable prizmanyx-* stack -
         # this is a single exact container name in the 15600-15999 range.
         subprocess.run(
             ["docker", "rm", "-f", container_name(ENV_NAME)], capture_output=True, check=False
         )
+        state.delete_env_dir(ENV_NAME)
 
     assert _docker_ps_names(container_name(ENV_NAME)) == []

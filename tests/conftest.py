@@ -26,12 +26,6 @@ def _docker_available() -> bool:
     return result.returncode == 0
 
 
-@pytest.fixture(scope="session")
-def docker_available() -> bool:
-    """True if a docker daemon is reachable from this machine right now."""
-    return _docker_available()
-
-
 # `config` is unused but must keep this exact name: pluggy injects pytest
 # hook arguments by name against the hookspec, not positionally, so
 # renaming or dropping it would break hook registration.
