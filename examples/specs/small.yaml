@@ -1,0 +1,42 @@
+# A minimal, hand-written EnvSpec - loadable via `foundry.envspec.load_spec`.
+#
+# Doubles as documentation for the shape `random_spec()` also produces: one
+# VPC with two subnets, a couple of instances split across them, one
+# database, two buckets, one queue, and one IAM role - the same structural
+# composition as `random_spec("S", seed=...)`.
+name_prefix: foundry-small-demo
+
+vpcs:
+  - cidr: 10.0.0.0/16
+    subnets:
+      - cidr: 10.0.0.0/24
+        az_suffix: a
+      - cidr: 10.0.1.0/24
+        az_suffix: b
+
+# subnet_index below refers to this flattened list of every vpc's subnets,
+# in order: 0 = 10.0.0.0/24 (az a), 1 = 10.0.1.0/24 (az b).
+instances:
+  - subnet_index: 0
+    instance_type: t3.micro
+    count: 1
+  - subnet_index: 1
+    instance_type: t3.small
+    count: 1
+
+databases:
+  - engine: postgres
+    instance_class: db.t3.micro
+    count: 1
+
+buckets:
+  - name_hint: app-data
+    count: 1
+  - name_hint: app-logs
+    count: 1
+
+queues:
+  - count: 1
+
+roles:
+  - count: 1
