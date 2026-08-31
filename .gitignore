@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.tfstate*
+
+# standard companions
+*.pyc
+.ruff_cache/
+.pytest_cache/
+*.egg-info/
+dist/
+.DS_Store
