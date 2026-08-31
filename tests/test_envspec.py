@@ -111,6 +111,27 @@ def test_random_spec_only_ever_draws_instance_types_floci_can_apply(size, seed):
 
 
 @pytest.mark.parametrize("size", SIZES)
+@pytest.mark.parametrize("seed", range(20))
+def test_random_spec_vpc_subnets_always_span_distinct_azs(size, seed):
+    # RDS DB subnet groups require their subnets to span >=2 distinct
+    # availability zones - a real AWS constraint (InvalidVPCNetworkState
+    # Fault otherwise), not a floci quirk - and materialize.py's
+    # aws_db_subnet_group depends on this generator invariant to ever
+    # produce an appliable spec whenever it has a database (see
+    # docs/DECISIONS.md entry 005). Before this test existed, `_random_vpc`
+    # drew each subnet's az_suffix INDEPENDENTLY via `rng.choice`, which
+    # could - and empirically did, for 69/200 S-profile seeds checked by
+    # hand while diagnosing a live acceptance failure - draw the SAME
+    # az_suffix for two subnets in the same vpc.
+    spec = random_spec(size, seed=seed)
+    for vpc in spec.vpcs:
+        az_suffixes = [subnet.az_suffix for subnet in vpc.subnets]
+        assert len(set(az_suffixes)) == len(az_suffixes), (
+            f"{size}/seed {seed}: a vpc's subnets {az_suffixes} collide on an AZ"
+        )
+
+
+@pytest.mark.parametrize("size", SIZES)
 def test_random_spec_subnet_indices_are_always_in_range(size):
     spec = random_spec(size, seed=99)
     subnet_count = sum(len(vpc.subnets) for vpc in spec.vpcs)

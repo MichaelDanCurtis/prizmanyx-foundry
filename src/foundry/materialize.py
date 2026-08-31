@@ -217,8 +217,101 @@ def _instance_blocks(spec: EnvSpec) -> list[str]:
     return blocks
 
 
+def _db_subnet_group_label(spec: EnvSpec) -> str:
+    return f"{spec.name_prefix}-dbsubnets"
+
+
+def _has_db_subnet_group(spec: EnvSpec) -> bool:
+    """Whether this spec's databases have anything to place a DB subnet
+    group in at all. `DatabaseSpec` carries no vpc/subnet reference of its
+    own (unlike `InstanceSpec.subnet_index`) - a database alongside zero
+    vpcs, or a vpc with zero subnets, is a pre-existing spec-modeling gap
+    this fix does not close; every current generator profile and
+    hand-written spec pairs a database with a vpc that has subnets, which
+    is the case this function (and `_db_subnet_group_blocks`,
+    `_database_blocks`) actually needs to handle correctly.
+    """
+    return bool(spec.databases and spec.vpcs and spec.vpcs[0].subnets)
+
+
+def _db_subnet_group_blocks(spec: EnvSpec) -> list[str]:
+    """The single `aws_db_subnet_group` every database in this spec shares,
+    if it has any (see `_has_db_subnet_group`).
+
+    Fixes a real bug (not a floci quirk): an `aws_db_instance` emitted
+    with no `db_subnet_group_name` falls back to the account's "default"
+    DB subnet group, which floci's fake AWS account (like a fresh real
+    one) has with ZERO subnets in it - `RDS: InvalidVPCNetworkStateFault:
+    No subnets available for DB subnet group default` at apply time. This
+    was never correct on real AWS either: a VPC-based RDS instance always
+    requires an explicit DB subnet group.
+
+    Two AWS-enforced requirements on a DB subnet group, both handled here:
+
+    1. **Same VPC only.** Every subnet in one DB subnet group must belong
+       to the SAME vpc - AWS rejects a group mixing subnets across vpcs
+       outright. This is why this function uses ONLY `spec.vpcs[0]`'s
+       subnets, not "every subnet in the spec": every current
+       `_SIZE_PROFILES` entry with more than one vpc (M, L, XL) also has
+       at least one database group, so "every subnet in the spec" would
+       recreate this exact bug's failure mode - just moved to a bigger
+       estate, and disguised as a DIFFERENT AWS error
+       (`InvalidSubnet`/`DBSubnetGroupDoesNotCoverEnoughAZs` instead of
+       "no subnets available"). `DatabaseSpec` has no field saying which
+       vpc a given database group belongs to - modeling that is out of
+       scope for slice 1-3 (the same "one shared thing per estate" call
+       already made for the `Application` tag) - so ONE subnet group,
+       from vpc-0, covering every database in the spec, is the simplest
+       version that is actually correct for every size profile today.
+    2. **>=2 distinct availability zones.** Asserted here, not silently
+       trusted from the generator: `envspec._random_vpc` now assigns
+       every subnet in a vpc a distinct `az_suffix` unconditionally (see
+       docs/DECISIONS.md entry 005), but this is the SAME "validate at
+       the boundary AND fail loud at the emitter" two-sided defense
+       `_hcl_string`'s own docstring already applies to injection - a
+       future regression in the generator (or a hand-written spec.yaml)
+       must fail loud here, not produce another silently-unappliable
+       estate.
+    """
+    if not _has_db_subnet_group(spec):
+        return []
+
+    first_vpc_subnets = spec.vpcs[0].subnets
+    distinct_azs = {subnet.az_suffix for subnet in first_vpc_subnets}
+    if len(distinct_azs) < 2:
+        raise ValueError(
+            f"{spec.name_prefix}: vpc-0 has {len(distinct_azs)} distinct availability "
+            f"zone(s) across its {len(first_vpc_subnets)} subnet(s) ({sorted(distinct_azs)}) "
+            "- an RDS DB subnet group requires at least 2. The generator must assign "
+            "distinct az_suffixes across a vpc's subnets whenever the spec also has a "
+            "database (see envspec._random_vpc)."
+        )
+
+    label = _db_subnet_group_label(spec)
+    subnet_id_lines = "\n".join(
+        f"    aws_subnet.{spec.name_prefix}-subnet-{i}.id," for i in range(len(first_vpc_subnets))
+    )
+    return [
+        f'resource "aws_db_subnet_group" "{label}" {{\n'
+        f'  name = "{label}"\n'
+        "  subnet_ids = [\n"
+        f"{subnet_id_lines}\n"
+        "  ]\n"
+        "\n"
+        "  tags = {\n"
+        f"{_application_tag_line(spec)}\n"
+        "  }\n"
+        "}"
+    ]
+
+
 def _database_blocks(spec: EnvSpec) -> list[str]:
     blocks = []
+    db_subnet_group_line = (
+        f"  db_subnet_group_name = aws_db_subnet_group.{_db_subnet_group_label(spec)}.name\n"
+        if _has_db_subnet_group(spec)
+        else ""
+    )
     for index, database in enumerate(spec.databases):
         label = f"{spec.name_prefix}-database-{index}"
         identifier = f"{spec.name_prefix}-database-{index}-${{count.index}}"
@@ -231,6 +324,7 @@ def _database_blocks(spec: EnvSpec) -> list[str]:
             f"  engine_version      = {_hcl_string(engine_version)}\n"
             f"  instance_class      = {_hcl_string(database.instance_class)}\n"
             "  allocated_storage   = 20\n"
+            f"{db_subnet_group_line}"
             f"  username            = {_hcl_string(_DEFAULT_DB_USERNAME)}\n"
             f"  password            = {_hcl_string(_DEFAULT_DB_PASSWORD)}\n"
             "  skip_final_snapshot = true\n"
@@ -319,13 +413,26 @@ def emit_terraform(spec: EnvSpec, env: EnvState) -> str:
     driver's idempotent re-apply) depend on this, not just convenience.
 
     Every terraform resource type this module knows how to emit
-    (aws_vpc, aws_subnet, aws_instance, aws_db_instance, aws_s3_bucket,
-    aws_sqs_queue, aws_iam_role) gets one block per spec list entry,
-    using terraform's own `count` meta-argument for that entry's `count`
-    field rather than emitting `count` separate blocks - keeping main.tf
-    sized to the number of spec GROUPS, not the number of individual AWS
-    resources they expand to (relevant once `random_spec("XL", ...)`
-    groups reach counts in the tens or hundreds).
+    (aws_vpc, aws_subnet, aws_instance, aws_db_subnet_group,
+    aws_db_instance, aws_s3_bucket, aws_sqs_queue, aws_iam_role) gets one
+    block per spec list entry, using terraform's own `count`
+    meta-argument for that entry's `count` field rather than emitting
+    `count` separate blocks - keeping main.tf sized to the number of spec
+    GROUPS, not the number of individual AWS resources they expand to
+    (relevant once `random_spec("XL", ...)` groups reach counts in the
+    tens or hundreds). `aws_db_subnet_group` is the one exception to
+    "one block per spec list entry": at most ONE is ever emitted
+    regardless of how many database groups the spec has - see
+    `_db_subnet_group_blocks`'s own docstring for why one shared group is
+    correct.
+
+    Can raise `ValueError` - not just return a string - when the spec has
+    a database but its first vpc cannot offer the >=2 distinct
+    availability zones an RDS DB subnet group requires (see
+    `_db_subnet_group_blocks`); this is the emitter's own defense against
+    a spec that would otherwise materialize into another silently-broken
+    estate, on top of (not instead of) the generator itself being fixed
+    to never produce one.
     """
     port = env.ports["aws"]
     sections = [
@@ -333,6 +440,7 @@ def emit_terraform(spec: EnvSpec, env: EnvState) -> str:
         *_vpc_blocks(spec),
         *_subnet_blocks(spec),
         *_instance_blocks(spec),
+        *_db_subnet_group_blocks(spec),
         *_database_blocks(spec),
         *_bucket_blocks(spec),
         *_queue_blocks(spec),

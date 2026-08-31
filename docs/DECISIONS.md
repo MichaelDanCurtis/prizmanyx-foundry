@@ -317,3 +317,87 @@ commit of this generator carries no `Application` tag and will infer zero
 migration units when run through Prizmanyx's discovery pipeline — it is
 extractable but not migratable. Every estate materialized from this
 commit forward carries the tag on every resource that supports one.
+
+---
+
+## 005 — RDS needs a real DB subnet group, which couples the generator's AZ
+guarantee to the materializer's requirement
+
+**Date:** 2026-08-31
+
+**Question.** Re-materializing the estate behind entry 004's fix (same
+tag, same spec shape) surfaced a DIFFERENT failure at real `terraform
+apply`: `RDS: InvalidVPCNetworkStateFault: No subnets available for DB
+subnet group default`. Is this a floci quirk, or a real materializer bug?
+
+**Finding.** A real bug, not a floci quirk. Every `aws_db_instance` this
+generator emitted had no `db_subnet_group_name` set, so it fell back to
+the AWS account's own "default" DB subnet group — which, on a fresh
+account (floci's fake one, and a real one alike), has ZERO subnets in it.
+This was never correct on real AWS either: a VPC-based RDS instance
+requires an explicit DB subnet group whose subnets span **at least 2
+distinct availability zones** (AWS's own hard requirement, not a
+convention). floci only tolerated the missing subnet group
+*intermittently* — nothing about it ever actually worked.
+
+Chasing the fix surfaced a SECOND, upstream bug: `envspec._random_vpc`
+drew each subnet's `az_suffix` **independently** via `rng.choice`, so two
+subnets in the same vpc could land in the SAME availability zone by pure
+chance — checked directly across 200 S-profile seeds, **69 (34.5%)**
+collided. A DB subnet group built from such a vpc's subnets would ALWAYS
+fail the >=2-distinct-AZ requirement, regardless of how the materializer
+built it.
+
+**Decision — two changes, coupled by design, one fixing each half:**
+
+1. **`materialize.emit_terraform`** now emits exactly one
+   `aws_db_subnet_group` (name `<name_prefix>-dbsubnets`, tagged
+   `Application=<name_prefix>` like every other taggable resource — see
+   entry 004) whenever the spec has >=1 database, and points every
+   `aws_db_instance` at it via `db_subnet_group_name`. Scoped to
+   **vpc-0's own subnets only** — not "every subnet in the spec" — because
+   AWS also requires every subnet in ONE DB subnet group to belong to the
+   SAME vpc, and every current `_SIZE_PROFILES` entry with more than one
+   vpc (M, L, XL) also has at least one database group; using every
+   subnet in the spec would have recreated this exact bug's failure mode
+   at a bigger estate size, under a different AWS error. `DatabaseSpec`
+   has no field saying which vpc a given database group belongs to —
+   modeling that is out of scope for slice 1-3, matching entry 004's own
+   "one shared thing per estate" simplification for `Application`. This
+   is a deliberate, recorded deviation from a more literal "tag every
+   subnet the estate has" reading — the literal version is correct for
+   any single-vpc spec (which is 100% of what's been exercised live to
+   date) but would silently break the first M/L/XL-with-database spec
+   anyone materializes for real.
+2. **`envspec._random_vpc`** now assigns every subnet in a vpc a
+   **distinct** `az_suffix` by position (`_AZ_SUFFIXES[subnet_idx]`)
+   instead of drawing one independently per subnet. This is the SAME
+   class of "acceptable determinism-content drift" entry 003 already
+   named and accepted: the same (size, seed) pair still always produces
+   the same spec, but a given seed's exact draws changed the moment this
+   landed, because the generator's RNG no longer consumes a `choice` call
+   per subnet for `az_suffix`. No persisted spec depends on the old draws
+   today, same as entry 003's own justification.
+
+**The coupling, stated explicitly (this is what "document the coupling"
+means):** `materialize._db_subnet_group_blocks` does not just TRUST the
+generator's new guarantee — it independently counts vpc-0's distinct
+`az_suffix` values and **raises `ValueError`** if there are fewer than 2,
+before ever handing terraform a subnet group that would fail at apply
+time. This is the same "validate at the boundary AND fail loud at the
+emitter" two-sided defense `_hcl_string`'s own docstring already applies
+to injection, applied here to a structural network-topology requirement
+instead: fixing the generator closes the hole for `random_spec`, but a
+hand-written `spec.yaml` (which `EnvSpec` itself does not constrain on
+this point — nothing today requires a vpc's subnets to span distinct
+AZs) could still reintroduce it, and must fail loud rather than
+materialize into another silently-broken estate.
+
+**Verified live**, not just via the pure emission tests: created a fresh
+environment (name_prefix `t4-dbsubnet-verify`, 1 vpc, 2 subnets in
+distinct AZs, 1 postgres database, no other resources) and ran the real
+`apply()` against it. `aws_db_subnet_group` created in under a second;
+`aws_db_instance` created successfully in 1m22s with no
+`InvalidVPCNetworkStateFault`; `Apply complete! Resources: 5 added, 0
+changed, 0 destroyed.` Torn down cleanly afterward (`remove_env` reaped
+the RDS child by its recorded-children primary path).

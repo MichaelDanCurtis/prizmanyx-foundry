@@ -145,6 +145,7 @@ def test_emit_terraform_contains_exactly_the_expected_resource_blocks_for_the_s_
         'resource "aws_subnet" "foundry-test-subnet-1" {',
         'resource "aws_instance" "foundry-test-instance-0" {',
         'resource "aws_instance" "foundry-test-instance-1" {',
+        'resource "aws_db_subnet_group" "foundry-test-dbsubnets" {',
         'resource "aws_db_instance" "foundry-test-database-0" {',
         'resource "aws_s3_bucket" "foundry-test-bucket-0" {',
         'resource "aws_s3_bucket" "foundry-test-bucket-1" {',
@@ -159,10 +160,120 @@ def test_emit_terraform_contains_exactly_the_expected_resource_blocks_for_the_s_
     assert tf_source.count('resource "aws_vpc"') == 1
     assert tf_source.count('resource "aws_subnet"') == 2
     assert tf_source.count('resource "aws_instance"') == 2
+    assert tf_source.count('resource "aws_db_subnet_group"') == 1
     assert tf_source.count('resource "aws_db_instance"') == 1
     assert tf_source.count('resource "aws_s3_bucket"') == 2
     assert tf_source.count('resource "aws_sqs_queue"') == 1
     assert tf_source.count('resource "aws_iam_role"') == 1
+
+
+# --- the DB subnet group: RDS instances need >=2-AZ network placement ------
+
+
+def test_emit_terraform_a_database_spec_emits_one_db_subnet_group_referenced_by_every_instance():
+    # A live acceptance re-run failed at real `terraform apply`: "RDS:
+    # InvalidVPCNetworkStateFault: No subnets available for DB subnet
+    # group default" - aws_db_instance with no db_subnet_group_name falls
+    # back to the account's "default" DB subnet group, which has no
+    # subnets. This was never correct on real AWS either (a VPC DB
+    # instance requires an explicit subnet group spanning >=2 AZs); floci
+    # only tolerated it intermittently.
+    spec = _two_instance_s_spec("db-demo")
+
+    tf_source = emit_terraform(spec, _env())
+
+    assert tf_source.count('resource "aws_db_subnet_group"') == 1
+    group_block = _resource_block(tf_source, 'resource "aws_db_subnet_group" "db-demo-dbsubnets"')
+    assert 'name = "db-demo-dbsubnets"' in group_block
+    assert "aws_subnet.db-demo-subnet-0.id" in group_block
+    assert "aws_subnet.db-demo-subnet-1.id" in group_block
+    assert 'Application = "db-demo"' in group_block  # it's taggable too
+
+    db_block = _resource_block(tf_source, 'resource "aws_db_instance" "db-demo-database-0"')
+    assert "db_subnet_group_name = aws_db_subnet_group.db-demo-dbsubnets.name" in db_block
+
+
+def test_emit_terraform_omits_the_db_subnet_group_when_the_spec_has_no_database():
+    spec = EnvSpec(
+        name_prefix="no-db-demo",
+        vpcs=[VpcSpec(cidr="10.0.0.0/16", subnets=[SubnetSpec(cidr="10.0.0.0/24", az_suffix="a")])],
+    )
+
+    tf_source = emit_terraform(spec, _env())
+
+    assert "aws_db_subnet_group" not in tf_source
+
+
+def test_emit_terraform_db_subnet_group_uses_only_the_first_vpcs_subnets_in_a_multi_vpc_spec():
+    # RDS requires every subnet in ONE DB subnet group to belong to the
+    # SAME vpc - mixing subnets across vpcs is rejected by real AWS
+    # outright. Every current size profile with >1 vpc (M, L, XL) also has
+    # >=1 database group, so naively using "every subnet in the spec"
+    # would repeat this exact bug at a bigger estate size. Scoped to
+    # vpc-0 instead - a documented, deliberate simplification
+    # (DatabaseSpec carries no vpc/subnet field of its own to place it
+    # more precisely - see materialize._db_subnet_group_blocks's own
+    # docstring).
+    spec = EnvSpec(
+        name_prefix="multi-vpc-db",
+        vpcs=[
+            VpcSpec(
+                cidr="10.0.0.0/16",
+                subnets=[
+                    SubnetSpec(cidr="10.0.0.0/24", az_suffix="a"),
+                    SubnetSpec(cidr="10.0.1.0/24", az_suffix="b"),
+                ],
+            ),
+            VpcSpec(
+                cidr="10.1.0.0/16",
+                subnets=[SubnetSpec(cidr="10.1.0.0/24", az_suffix="a")],
+            ),
+        ],
+        databases=[DatabaseSpec(engine="postgres", instance_class="db.t3.micro", count=1)],
+    )
+
+    tf_source = emit_terraform(spec, _env())
+
+    group_block = _resource_block(
+        tf_source, 'resource "aws_db_subnet_group" "multi-vpc-db-dbsubnets"'
+    )
+    assert "aws_subnet.multi-vpc-db-subnet-0.id" in group_block
+    assert "aws_subnet.multi-vpc-db-subnet-1.id" in group_block
+    # subnet-2 is vpc-1's own subnet - must NOT be pulled into vpc-0's group.
+    assert "aws_subnet.multi-vpc-db-subnet-2.id" not in group_block
+
+
+def test_emit_terraform_raises_if_the_first_vpc_cannot_offer_two_distinct_azs():
+    # The emitter's own second line of defense - not just trusting the
+    # generator - see _db_subnet_group_blocks's docstring. Two subnets,
+    # same az_suffix: exactly the shape `_random_vpc` could produce before
+    # it was fixed to guarantee distinctness (docs/DECISIONS.md entry 005).
+    spec = EnvSpec(
+        name_prefix="same-az-demo",
+        vpcs=[
+            VpcSpec(
+                cidr="10.0.0.0/16",
+                subnets=[
+                    SubnetSpec(cidr="10.0.0.0/24", az_suffix="a"),
+                    SubnetSpec(cidr="10.0.1.0/24", az_suffix="a"),
+                ],
+            )
+        ],
+        databases=[DatabaseSpec(engine="postgres", instance_class="db.t3.micro", count=1)],
+    )
+
+    with pytest.raises(ValueError, match="distinct availability zone"):
+        emit_terraform(spec, _env())
+
+
+def test_emit_terraform_db_subnet_group_determinism_preserved():
+    spec = _two_instance_s_spec("db-determinism")
+    env = _env()
+
+    first = emit_terraform(spec, env)
+    second = emit_terraform(spec, env)
+
+    assert first == second
 
 
 # --- the Application tag: the deterministic migration-unit inference seed ---
@@ -192,6 +303,7 @@ def test_emit_terraform_tags_every_taggable_resource_with_application_equal_to_n
         'resource "aws_subnet" "tag-demo-subnet-1"',
         'resource "aws_instance" "tag-demo-instance-0"',
         'resource "aws_instance" "tag-demo-instance-1"',
+        'resource "aws_db_subnet_group" "tag-demo-dbsubnets"',
         'resource "aws_db_instance" "tag-demo-database-0"',
         'resource "aws_s3_bucket" "tag-demo-bucket-0"',
         'resource "aws_s3_bucket" "tag-demo-bucket-1"',
@@ -230,8 +342,10 @@ def test_emit_terraform_application_tag_determinism_and_name_prefix_scoping():
     assert first == second
     # One shared value across every resource, by design: the inference
     # groups candidate nodes by tag VALUE, so a single Application value
-    # joins them all into one coherent migration unit.
-    assert first.count('Application = "determinism-demo"') == 10
+    # joins them all into one coherent migration unit. 11, not 10: the
+    # "2-instance S spec" fixture has a database, so aws_db_subnet_group
+    # (itself taggable) is now part of the taggable surface too.
+    assert first.count('Application = "determinism-demo"') == 11
     assert "Application = " not in first.replace('Application = "determinism-demo"', "")
 
 

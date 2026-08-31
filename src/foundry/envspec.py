@@ -368,9 +368,29 @@ def random_spec(size: Literal["S", "M", "L", "XL"], seed: int) -> EnvSpec:
 
 
 def _random_vpc(rng: random.Random, subnet_count: int) -> VpcSpec:
+    """One vpc with `subnet_count` subnets, each in its OWN availability zone.
+
+    `az_suffix` is assigned by subnet POSITION (`_AZ_SUFFIXES[i]`), not
+    drawn independently per subnet via `rng.choice` as an earlier version
+    of this function did - that could, and empirically did for 69/200
+    S-profile seeds checked while diagnosing a live acceptance failure,
+    draw the SAME az_suffix for two subnets in the same vpc. RDS DB
+    subnet groups require their subnets to span >=2 distinct AZs (a real
+    AWS constraint - `InvalidVPCNetworkStateFault` otherwise, not a floci
+    quirk), and `materialize._db_subnet_group_blocks` depends on this
+    invariant to ever emit an appliable spec whenever it has a database
+    (see docs/DECISIONS.md entry 005, which also records this as an
+    accepted determinism-content change per entry 003's own precedent).
+
+    Every current `_SIZE_PROFILES` entry uses `subnets_per_vpc` of 2 or 3,
+    never more than `len(_AZ_SUFFIXES)` (3) - so this never needs to
+    repeat an AZ letter today. A future profile needing more subnets per
+    vpc than `_AZ_SUFFIXES` has entries would need to widen that tuple
+    first; this function does not silently wrap around and repeat one.
+    """
     octet = rng.randint(0, 255)
     subnets = [
-        SubnetSpec(cidr=f"10.{octet}.{subnet_idx}.0/24", az_suffix=rng.choice(_AZ_SUFFIXES))
+        SubnetSpec(cidr=f"10.{octet}.{subnet_idx}.0/24", az_suffix=_AZ_SUFFIXES[subnet_idx])
         for subnet_idx in range(subnet_count)
     ]
     return VpcSpec(cidr=f"10.{octet}.0.0/16", subnets=subnets)
