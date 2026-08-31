@@ -7,6 +7,7 @@ No network, no httpx transport, no running Prizmanyx anywhere in this file.
 
 from __future__ import annotations
 
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ import httpx
 import pytest
 
 from foundry import state
+from foundry.arm_materialize import ArmApplyResult
 from foundry.loop import (
     DEFAULT_WORKER_HOST,
     STEP_ORDER,
@@ -37,11 +39,43 @@ def _isolated_envs_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(state, "ENVS_DIR", tmp_path / "envs")
 
 
-def _env(name: str = "demo", port: int = 15600) -> EnvState:
+@pytest.fixture(autouse=True)
+def _no_real_docker(monkeypatch):
+    # deploy_apply's OWN before/after `docker ps` snapshot (loop.py's
+    # `_floci_children_snapshot`) must never shell out for real in this
+    # file - every test here fakes both the client and the materializer
+    # (see the module docstring), so docker must be faked too. Defaults to
+    # "no containers, ever" (empty before AND after every call); tests that
+    # care about a spawned-children delta drive it through the fake
+    # `materialize`'s own `spawned_children` field instead (see
+    # `_FakeDocker` below for the one test that DOES want a real ps delta).
+    def _empty_ps(args, *, timeout=None):  # noqa: ARG001
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("foundry.loop.run_docker", _empty_ps)
+
+
+class _FakeDocker:
+    """Answers `docker ps --filter name=floci-` from a queue of canned name
+    snapshots, one per call - for the one test that exercises loop.py's OWN
+    before/after diff directly (`_no_real_docker`'s default answers "no
+    containers" for everything else)."""
+
+    def __init__(self, snapshots: list[set[str]]) -> None:
+        self._snapshots = [set(s) for s in snapshots]
+
+    def __call__(self, args, *, timeout=None):  # noqa: ARG002
+        names = self._snapshots.pop(0) if self._snapshots else set()
+        return subprocess.CompletedProcess(
+            args, 0, stdout="".join(f"{n}\n" for n in sorted(names)), stderr=""
+        )
+
+
+def _env(name: str = "demo", port: int = 15600, az_port: int = 14577) -> EnvState:
     return EnvState(
         name=name,
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
-        ports={"aws": port},
+        ports={"aws": port, "az": az_port},
         spec_path=Path(f"/envs/{name}/spec.yaml"),
         status="running",
     )
@@ -59,6 +93,17 @@ class _FakeClient:
     makes `list_translations` return empty forever for that one unit id,
     forcing `_poll_translation_id` to exhaust its attempt budget and time
     out - the fixture behind the partial-translation-ids test.
+
+    `expected_resources`, when set, maps translation id -> the
+    `list_translation_resources` row list to return for it - defaults to a
+    ResourceGroup row named `rg-<tid>` plus one StorageAccount row, which is
+    enough to exercise the RG-naming closure (`deploy_apply`/`verify` must
+    both use `rg-<tid>`, never a foundry-invented name). `verify_responses`,
+    when set, maps translation id -> the `verify_translation` JSON body to
+    return for it - defaults to an all-matched, zero-mismatch verdict.
+    `verify_502_for`, when set, makes `verify_translation` raise the same
+    `LoopStepError` shape the real 502 "bridge unreachable" response
+    produces, for that one translation id.
     """
 
     def __init__(
@@ -68,12 +113,19 @@ class _FakeClient:
         translate_fails_at: int | None = None,
         approve_fails_at: int | None = None,
         translation_never_appears_for: int | None = None,
+        expected_resources: dict[int, list[dict[str, object]]] | None = None,
+        verify_responses: dict[int, dict[str, object]] | None = None,
+        verify_502_for: int | None = None,
     ) -> None:
         self.calls: list[str] = []
         self._units = units if units is not None else [{"id": 1}, {"id": 2}]
         self._translate_fails_at = translate_fails_at
         self._approve_fails_at = approve_fails_at
         self._translation_never_appears_for = translation_never_appears_for
+        self._expected_resources = expected_resources or {}
+        self._verify_responses = verify_responses or {}
+        self._verify_502_for = verify_502_for
+        self.verify_requests: list[tuple[int, str, str]] = []
         # Populated as the loop calls through - every parameter below is
         # captured somewhere rather than silently accepted-and-dropped, so
         # a test can assert on exactly what the loop sent without this
@@ -161,6 +213,108 @@ class _FakeClient:
         self.calls.append(f"deploy_preview:{translation_id}")
         return {"workflow_id": "wf-deploy", "mode": "preview", "translation_id": translation_id}
 
+    def list_translation_resources(self, translation_id):
+        self.calls.append(f"list_translation_resources:{translation_id}")
+        return self._expected_resources.get(
+            translation_id,
+            [
+                {
+                    "azure_resource_type": "azure_native.resources.ResourceGroup",
+                    "azure_logical_name": f"rg-{translation_id}",
+                    "azure_properties": {},
+                },
+                {
+                    "azure_resource_type": "azure_native.storage.StorageAccount",
+                    "azure_logical_name": f"sa-{translation_id}",
+                    "azure_properties": {},
+                },
+            ],
+        )
+
+    def verify_translation(self, translation_id, *, azure_subscription_id, azure_resource_group):
+        self.calls.append(f"verify_translation:{translation_id}")
+        self.verify_requests.append((translation_id, azure_subscription_id, azure_resource_group))
+        if translation_id == self._verify_502_for:
+            raise LoopStepError("verify", 502, "ARM endpoint http://floci-az:8080 unreachable")
+        return self._verify_responses.get(
+            translation_id,
+            {
+                "verification_run_id": 900 + translation_id,
+                "all_matched": True,
+                "matched_count": 2,
+                "mismatch_count": 0,
+                "missing_count": 0,
+                "extra_count": 0,
+            },
+        )
+
+
+class _FakeMaterializer:
+    """A hand-written double for `run_loop`'s `materialize` seam
+    (`foundry.loop.ArmMaterializeFn`) - the fake behind every `deploy_apply`
+    test, no `arm_materialize`, no docker, no httpx.
+
+    `fail_for`, when set, makes the call for that one translation id return
+    an `ArmApplyResult` with `ok=False` and a canned failure - every OTHER
+    translation still gets a clean `ok=True` result. `spawned_children`
+    applies to every call.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_for: int | None = None,
+        spawned_children: list[str] | None = None,
+        applied: int = 2,
+    ) -> None:
+        self.calls: list[tuple[str, str, str, list[dict[str, object]]]] = []
+        self._fail_for = fail_for
+        self._spawned_children = spawned_children or []
+        self._applied = applied
+
+    def __call__(self, az_base_url, subscription_id, resource_group, resources):
+        self.calls.append((az_base_url, subscription_id, resource_group, resources))
+        # The resources list always carries the RG row plus the fixture's
+        # own translation id baked into every logical name (see
+        # `_FakeClient.list_translation_resources`'s default) - recover it
+        # from `resource_group` ("rg-<tid>") to decide fail_for cleanly.
+        translation_id = int(resource_group.removeprefix("rg-"))
+        if translation_id == self._fail_for:
+            return ArmApplyResult(
+                ok=False,
+                applied=0,
+                skipped_unmapped=[],
+                failures=[{"name": "sa-x", "status": 400, "body": {"error": "bad request"}}],
+                provisioning_timeouts=[],
+                spawned_children=self._spawned_children,
+            )
+        return ArmApplyResult(
+            ok=True,
+            applied=self._applied,
+            skipped_unmapped=[],
+            failures=[],
+            provisioning_timeouts=[],
+            spawned_children=self._spawned_children,
+        )
+
+
+def _run(env: EnvState, client, **kwargs) -> LoopReport:
+    """`run_loop`, defaulting `materialize` to a clean `_FakeMaterializer()`
+    when the caller does not supply one.
+
+    Every pre-existing test in this file predates `deploy_apply` and calls
+    `run_loop` with no opinion at all about materializing - `run_loop`'s own
+    default `materialize` is the REAL `arm_materialize.apply_expected_
+    resources`, which would make a genuine httpx call against
+    `http://localhost:<az_port>` with no floci-az listening there in this
+    hermetic suite. Routing every call in this file through here (instead of
+    `run_loop` directly) keeps that default from ever firing unfaked - the
+    same "no network, no httpx transport" promise this module's own
+    docstring already makes for `client`.
+    """
+    kwargs.setdefault("materialize", _FakeMaterializer())
+    return run_loop(env, client, **kwargs)
+
 
 def _step_statuses(report: LoopReport) -> dict[str, str]:
     return {step.name: step.status for step in report.steps}
@@ -171,7 +325,7 @@ def _step_statuses(report: LoopReport) -> dict[str, str]:
 
 def test_happy_path_is_pass_with_every_step_recorded():
     client = _FakeClient()
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert report.verdict == "PASS"
     assert report.failed_step is None
@@ -184,7 +338,7 @@ def test_happy_path_is_pass_with_every_step_recorded():
 
 def test_happy_path_captures_program_graph_run_units_and_translation_ids():
     client = _FakeClient()
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert report.program_id == 7
     assert report.graph_run_id == 55
@@ -199,7 +353,7 @@ def test_happy_path_registers_the_worker_reachable_endpoint_by_default():
     # container itself, unreachable (Task 8 live finding). The default must
     # be the worker-reachable form, not the host-reachable one.
     client = _FakeClient()
-    run_loop(_env(port=15900), client)
+    _run(_env(port=15900), client)
 
     assert client.registered_endpoint_url == "http://host.docker.internal:15900"
 
@@ -209,7 +363,7 @@ def test_run_loop_honors_a_worker_host_override():
     # compose network under a service name, would need something other
     # than Docker Desktop's host.docker.internal.
     client = _FakeClient()
-    run_loop(_env(port=15900), client, worker_host="172.17.0.1")
+    _run(_env(port=15900), client, worker_host="172.17.0.1")
 
     assert client.registered_endpoint_url == "http://172.17.0.1:15900"
 
@@ -224,7 +378,7 @@ def test_worker_reachable_endpoint_default_and_override():
 
 def test_happy_path_records_the_worker_endpoint_url_on_the_report():
     client = _FakeClient()
-    report = run_loop(_env(port=15900), client)
+    report = _run(_env(port=15900), client)
 
     assert report.worker_endpoint_url == "http://host.docker.internal:15900"
     # It must be exactly what was actually sent to register_env_connection -
@@ -235,7 +389,7 @@ def test_happy_path_records_the_worker_endpoint_url_on_the_report():
 
 def test_happy_path_writes_the_export_pack_into_the_envs_directory():
     client = _FakeClient()
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert len(report.artifact_paths) == 1
     exported = Path(report.artifact_paths[0])
@@ -245,7 +399,7 @@ def test_happy_path_writes_the_export_pack_into_the_envs_directory():
 
 def test_happy_path_calls_every_client_method_in_pipeline_order():
     client = _FakeClient()
-    run_loop(_env(), client)
+    _run(_env(), client)
 
     assert client.calls == [
         "login",
@@ -271,6 +425,10 @@ def test_happy_path_calls_every_client_method_in_pipeline_order():
         "export_program",
         "deploy_preview:101",
         "deploy_preview:102",
+        "list_translation_resources:101",
+        "list_translation_resources:102",
+        "verify_translation:101",
+        "verify_translation:102",
     ]
 
 
@@ -279,7 +437,7 @@ def test_happy_path_calls_every_client_method_in_pipeline_order():
 
 def test_decisions_table_carries_every_auto_gate_verbatim():
     client = _FakeClient()
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert report.decisions == [
         Decision(step="accept_catalog_defaults", choice="accept-defaults", detail=""),
@@ -300,7 +458,7 @@ def test_decisions_table_carries_every_auto_gate_verbatim():
 
 def test_a_409_at_translate_fails_that_step_with_verbatim_detail():
     client = _FakeClient(translate_fails_at=2)
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert report.verdict == "FAIL"
     assert report.failed_step == "translate"
@@ -309,7 +467,7 @@ def test_a_409_at_translate_fails_that_step_with_verbatim_detail():
 
 def test_a_409_at_translate_leaves_every_later_step_explicitly_unrun():
     client = _FakeClient(translate_fails_at=2)
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     statuses = _step_statuses(report)
     passed_before_translate = STEP_ORDER[: STEP_ORDER.index("translate")]
@@ -331,7 +489,7 @@ def test_a_409_at_translate_still_records_every_decision_made_before_it():
     # Everything up through sign_off succeeded in this scenario - those
     # decisions were genuinely walked and must survive the later failure.
     client = _FakeClient(translate_fails_at=2)
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert report.decisions == [
         Decision(step="accept_catalog_defaults", choice="accept-defaults", detail=""),
@@ -348,7 +506,7 @@ def test_a_409_at_translate_still_records_every_decision_made_before_it():
 
 def test_a_409_at_translate_leaves_no_artifact_and_no_translation_ids():
     client = _FakeClient(translate_fails_at=1)
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert report.artifact_paths == []
     assert report.translation_ids == []
@@ -359,7 +517,7 @@ def test_a_409_at_translate_leaves_no_artifact_and_no_translation_ids():
 
 def test_a_409_at_translate_aborts_the_batch_the_second_unit_is_never_called():
     client = _FakeClient(translate_fails_at=1)
-    run_loop(_env(), client)
+    _run(_env(), client)
 
     # unit 1 fails first (units are processed in list order) - unit 2's
     # translate_unit must never be attempted once the batch has aborted.
@@ -372,7 +530,7 @@ def test_a_failure_at_a_non_boundary_unit_in_a_longer_roster_preserves_earlier_p
     # where "first" and "next-to-last" are indistinguishable.
     units = [{"id": i} for i in range(1, 6)]
     client = _FakeClient(units=units, approve_fails_at=3)
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert report.verdict == "FAIL"
     assert report.failed_step == "approve"
@@ -415,7 +573,7 @@ def test_a_failure_at_a_non_boundary_unit_in_a_longer_roster_preserves_earlier_p
 
 def test_a_translation_timeout_preserves_the_id_already_resolved_before_it():
     client = _FakeClient(translation_never_appears_for=2)
-    report = run_loop(_env(), client, translation_poll_max_attempts=2, translation_poll_interval=0)
+    report = _run(_env(), client, translation_poll_max_attempts=2, translation_poll_interval=0)
 
     assert report.verdict == "FAIL"
     assert report.failed_step == "poll_translations"
@@ -448,7 +606,7 @@ def test_a_failed_pipeline_run_status_fails_the_poll_step_even_without_an_except
             return {"id": run_id, "status": "failed", "error_message": "extractor crashed"}
 
     client = _RunFailsClient()
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     assert report.verdict == "FAIL"
     assert report.failed_step == "poll_pipeline_run"
@@ -456,12 +614,230 @@ def test_a_failed_pipeline_run_status_fails_the_poll_step_even_without_an_except
     assert _step_statuses(report)["accept_catalog_defaults"] == "UNRUN"
 
 
+# --- deploy_apply + verify: the loop's own round trip against emulated Azure -
+
+
+def test_happy_path_deploy_apply_and_verify_pass_with_all_matched_recorded():
+    client = _FakeClient()
+    materializer = _FakeMaterializer()
+    report = _run(_env(), client, materialize=materializer)
+
+    assert report.verdict == "PASS"
+    statuses = _step_statuses(report)
+    assert statuses["deploy_apply"] == "PASSED"
+    assert statuses["verify"] == "PASSED"
+
+    assert [d.translation_id for d in report.deployment_results] == [101, 102]
+    assert all(d.ok for d in report.deployment_results)
+
+    assert [v.translation_id for v in report.verification_results] == [101, 102]
+    assert all(v.all_matched for v in report.verification_results)
+    assert [v.matched_count for v in report.verification_results] == [2, 2]
+
+
+def test_a_materialize_failure_fails_deploy_apply_and_leaves_verify_unrun():
+    client = _FakeClient()
+    materializer = _FakeMaterializer(fail_for=101)
+    report = _run(_env(), client, materialize=materializer)
+
+    assert report.verdict == "FAIL"
+    assert report.failed_step == "deploy_apply"
+    assert "101" in report.failure_detail
+
+    statuses = _step_statuses(report)
+    assert statuses["deploy_preview"] == "PASSED"
+    assert statuses["deploy_apply"] == "FAILED"
+    assert statuses["verify"] == "UNRUN"
+
+    # The failing translation's own deployment result IS recorded - real,
+    # already-happened progress, exactly like `decisions`/`unit_ids` survive
+    # a partial batch elsewhere in this file.
+    assert len(report.deployment_results) == 1
+    assert report.deployment_results[0].translation_id == 101
+    assert report.deployment_results[0].ok is False
+    assert report.deployment_results[0].failures
+
+    # verify never ran at all for either translation.
+    assert report.verification_results == []
+    assert "verify_translation:101" not in client.calls
+    assert "verify_translation:102" not in client.calls
+
+
+def test_a_missing_resource_at_verify_fails_that_step_with_the_counts():
+    client = _FakeClient(
+        verify_responses={
+            102: {
+                "verification_run_id": 42,
+                "all_matched": False,
+                "matched_count": 1,
+                "mismatch_count": 0,
+                "missing_count": 1,
+                "extra_count": 0,
+            }
+        }
+    )
+    report = _run(_env(), client, materialize=_FakeMaterializer())
+
+    assert report.verdict == "FAIL"
+    assert report.failed_step == "verify"
+    assert "missing=1" in report.failure_detail
+    assert "102" in report.failure_detail
+
+    # translation 101 verified clean and IS recorded before 102's failure -
+    # partial progress, not collapsed to empty.
+    assert [v.translation_id for v in report.verification_results] == [101, 102]
+    assert report.verification_results[0].all_matched is True
+    assert report.verification_results[1].all_matched is False
+    assert report.verification_results[1].missing_count == 1
+
+
+def test_a_502_from_verify_fails_the_step_with_the_bridge_detail_verbatim():
+    client = _FakeClient(verify_502_for=101)
+    report = _run(_env(), client, materialize=_FakeMaterializer())
+
+    assert report.verdict == "FAIL"
+    assert report.failed_step == "verify"
+    assert report.failure_detail == "ARM endpoint http://floci-az:8080 unreachable"
+    # Nothing for 101 was recorded (the call raised outright, honest) and
+    # 102 was never attempted once the batch aborted.
+    assert report.verification_results == []
+    assert "verify_translation:102" not in client.calls
+
+
+def test_the_resource_group_name_used_is_the_expected_resources_rg_row_not_a_foundry_name():
+    # Carry #1 (mandatory, Task 3's review): deploy_apply and verify must
+    # both use the ResourceGroup row's OWN azure_logical_name, never a
+    # foundry-invented one like "foundry-<env>-<tid>" - a mismatch there
+    # makes verify read every resource as missing while deploy_apply can
+    # still report ok=True.
+    client = _FakeClient(
+        expected_resources={
+            101: [
+                {
+                    "azure_resource_type": "azure_native.resources.ResourceGroup",
+                    "azure_logical_name": "unit-42-prod-rg",
+                    "azure_properties": {},
+                },
+                {
+                    "azure_resource_type": "azure_native.storage.StorageAccount",
+                    "azure_logical_name": "sa1",
+                    "azure_properties": {},
+                },
+            ]
+        },
+        units=[{"id": 1}],
+    )
+    # `_FakeMaterializer`'s own `__call__` derives fail_for's id from the
+    # "rg-<tid>" naming convention `_FakeClient`'s DEFAULT resources use -
+    # this test deliberately uses a DIFFERENT resource group name, so a
+    # plain call-capturing fake stands in instead.
+    calls: list[tuple[str, str, str, list[dict[str, object]]]] = []
+
+    def _materialize(az_base_url, subscription_id, resource_group, resources):
+        calls.append((az_base_url, subscription_id, resource_group, resources))
+        return ArmApplyResult(
+            ok=True,
+            applied=2,
+            skipped_unmapped=[],
+            failures=[],
+            provisioning_timeouts=[],
+            spawned_children=[],
+        )
+
+    report = _run(_env(), client, materialize=_materialize)
+
+    assert report.verdict == "PASS"
+    assert len(calls) == 1
+    az_base_url, subscription_id, resource_group, _resources = calls[0]
+    assert resource_group == "unit-42-prod-rg"
+    assert az_base_url == "http://localhost:14577"
+    assert subscription_id == "00000000-0000-0000-0000-000000000000"
+
+    # verify_translation got asked to diff the EXACT same resource group -
+    # never a value independently re-derived.
+    assert client.verify_requests == [
+        (101, "00000000-0000-0000-0000-000000000000", "unit-42-prod-rg")
+    ]
+    assert report.deployment_results[0].resource_group == "unit-42-prod-rg"
+    assert report.verification_results[0].resource_group == "unit-42-prod-rg"
+
+
+def test_spawned_children_from_deploy_apply_are_persisted_into_env_state():
+    # Carry #2 (mandatory, Task 3's review): union, like the AWS side
+    # (tf_runner.apply_in_dir), so engine.remove_env can reap them later.
+    env = _env()
+    client = _FakeClient()
+    materializer = _FakeMaterializer(spawned_children=["floci-az-pg-demo"])
+
+    _run(env, client, materialize=materializer)
+
+    reloaded = state.load_state(env.name)
+    assert reloaded.children == ["floci-az-pg-demo"]
+
+
+def test_spawned_children_union_with_children_the_env_already_carried():
+    env = _env()
+    env = env.model_copy(update={"children": ["floci-rds-old-child"]})
+    state.save_state(env)
+    client = _FakeClient()
+    materializer = _FakeMaterializer(spawned_children=["floci-az-pg-demo"])
+
+    _run(env, client, materialize=materializer)
+
+    reloaded = state.load_state(env.name)
+    assert sorted(reloaded.children) == ["floci-az-pg-demo", "floci-rds-old-child"]
+
+
+def test_a_crash_mid_materialize_still_persists_whatever_children_appeared(monkeypatch):
+    # Carry #2's own worst case: a transport error propagates OUT of
+    # `materialize` before it can return its own `spawned_children` at all -
+    # loop.py's OWN before/after `docker ps` snapshot, taken around the
+    # whole call, is what keeps this from orphaning the child silently.
+    monkeypatch.setattr("foundry.loop.run_docker", _FakeDocker([set(), {"floci-az-pg-crashed"}]))
+    env = _env()
+    client = _FakeClient()
+
+    def _crashes(az_base_url, subscription_id, resource_group, resources):  # noqa: ARG001
+        raise ConnectionError("floci-az refused the connection")
+
+    with pytest.raises(ConnectionError):
+        _run(env, client, materialize=_crashes)
+
+    reloaded = state.load_state(env.name)
+    assert reloaded.children == ["floci-az-pg-crashed"]
+
+
+def test_report_json_round_trips_deployment_and_verification_results():
+    client = _FakeClient()
+    report = _run(_env(), client, materialize=_FakeMaterializer())
+
+    write_report(report, env_dir("demo"))
+    reloaded = load_report(env_dir("demo"))
+
+    assert reloaded == report
+    assert reloaded.deployment_results == report.deployment_results
+    assert reloaded.verification_results == report.verification_results
+
+
+def test_write_report_renders_the_deployment_and_verification_sections():
+    client = _FakeClient()
+    report = _run(_env(), client, materialize=_FakeMaterializer())
+
+    md_path, _json_path = write_report(report, env_dir("demo"))
+    text = md_path.read_text()
+
+    assert "## Deployments (deploy_apply)" in text
+    assert "## Verification (verify)" in text
+    assert "rg-101" in text
+    assert "True" in text  # ok / all_matched rendered
+
+
 # --- report.md / report.json ------------------------------------------------
 
 
 def test_write_report_produces_a_markdown_file_with_the_fidelity_line_and_verdict():
     client = _FakeClient()
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     md_path, _json_path = write_report(report, env_dir("demo"))
 
@@ -480,7 +856,7 @@ def test_write_report_produces_a_markdown_file_with_the_fidelity_line_and_verdic
 
 def test_write_report_produces_a_markdown_file_naming_the_failed_step():
     client = _FakeClient(translate_fails_at=1)
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     md_path, _json_path = write_report(report, env_dir("demo"))
 
@@ -492,7 +868,7 @@ def test_write_report_produces_a_markdown_file_naming_the_failed_step():
 
 def test_report_json_round_trips_through_load_report():
     client = _FakeClient()
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     write_report(report, env_dir("demo"))
     reloaded = load_report(env_dir("demo"))
@@ -502,7 +878,7 @@ def test_report_json_round_trips_through_load_report():
 
 def test_write_report_creates_the_directory_if_it_does_not_exist_yet(tmp_path):
     client = _FakeClient()
-    report = run_loop(_env(), client)
+    report = _run(_env(), client)
 
     target = tmp_path / "somewhere" / "nested"
     md_path, json_path = write_report(report, target)

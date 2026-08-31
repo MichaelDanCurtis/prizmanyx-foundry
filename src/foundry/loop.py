@@ -9,10 +9,14 @@ disposition every unit `rehost` (the only disposition that lets translate
 proceed - `retain`/`retire` block it, per `decide_disposition`'s own
 docstring), sign every required role, wait for the exit gate, translate
 every unit, wait for each translation to materialize, export the program
-pack, and trigger a preview deploy per translation. Slice 3 stops there -
-apply-beyond-preview awaits the ARM adapter (Track B); see
-`report.FIDELITY_LINE`, which every written report states verbatim rather
-than leaving that limit implicit.
+pack, trigger a preview deploy per translation, materialize each
+translation's EXPECTED estate into this environment's own floci-az
+(`deploy_apply`, via `arm_materialize.apply_expected_resources`), and ask
+Prizmanyx to re-extract that estate over ARM and diff it against expected
+(`verify`, via `PrizmanyxClient.verify_translation`) - the full round trip
+this slice completes. See `report.FIDELITY_LINE`, which every written
+report states verbatim, for exactly what each of `deploy_preview`,
+`deploy_apply`, and `verify` does and does not prove.
 
 Every step is recorded - name, PASSED/FAILED/UNRUN, timing - in
 `LoopReport.steps`, in `STEP_ORDER` regardless of outcome: a step this run
@@ -37,15 +41,29 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
-from typing import Literal, Protocol, TypeVar
+from typing import Any, Literal, Protocol, TypeVar
 
 import httpx
 from pydantic import BaseModel, Field
 
+from foundry import state
+from foundry.arm_materialize import ArmApplyResult, apply_expected_resources
+from foundry.engine import run_docker
 from foundry.prizmanyx_client import JSONList, JSONObject, LoopStepError
 from foundry.state import EnvState, ensure_env_dir
 
 _T = TypeVar("_T")
+
+# The injectable materializer seam `deploy_apply` calls through - defaults to
+# the real `arm_materialize.apply_expected_resources`, overridable (as
+# `run_loop`'s `materialize` parameter) so `tests/test_loop.py` can drive
+# `deploy_apply` with a hand-written fake, exactly like `PipelineClient`
+# lets tests drive every OTHER step with no network/docker at all. Typed as
+# a plain 4-positional-argument `Callable` (not `arm_materialize`'s own
+# richer signature, which also accepts `arm_client`/poll-budget keywords
+# with defaults) because that is the exact shape `deploy_apply` calls it
+# with - a fake only needs to satisfy this narrower shape.
+ArmMaterializeFn = Callable[[str, str, str, JSONList], ArmApplyResult]
 
 # The only account/region floci-backed environments ever present (see
 # `PrizmanyxClient.register_env_connection`'s own docstring: every
@@ -82,6 +100,28 @@ _SIGN_OFF_ROLES: tuple[str, ...] = ("engineer", "program_mgmt", "delivery_md", "
 _EXPORT_FORMAT = "csv"
 _EXPORT_FILENAME = "export.csv"
 
+# The placeholder Azure subscription every `deploy_apply`/`verify` call uses -
+# there is no real Azure subscription anywhere in a bare foundry checkout,
+# and floci-az itself does not validate the subscription segment of an ARM
+# path, so one fixed placeholder is correct for every environment/run.
+_AZ_PLACEHOLDER_SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
+
+# arm_materialize._RESOURCE_GROUP_TOKEN, duplicated rather than imported -
+# this module reaches into `arm_materialize` for its public
+# `apply_expected_resources`/`ArmApplyResult` surface only, never a private
+# symbol across that boundary (the same discipline `arm_materialize` itself
+# applies to `tf_runner`'s private `_running_floci_container_names`, per its
+# own module docstring).
+_RESOURCE_GROUP_TOKEN = "azure_native.resources.ResourceGroup"
+
+# tf_runner._FLOCI_PS_FILTER / arm_materialize._FLOCI_PS_FILTER, duplicated
+# for the same "no private cross-module reach" reason above - this module's
+# OWN before/after `docker ps` snapshot around the whole `deploy_apply` call
+# (see `_floci_children_snapshot`), independent of whatever
+# `ArmApplyResult.spawned_children` the materializer itself manages to
+# compute and return.
+_FLOCI_PS_FILTER = "name=floci-"
+
 # `list_translations` has no client-side poll helper (unlike
 # poll_pipeline_run/poll_exit_gate) because the translation row is created
 # by the translate workflow, not the translate_unit route itself - see that
@@ -114,6 +154,8 @@ STEP_ORDER: tuple[str, ...] = (
     "poll_translations",
     "export",
     "deploy_preview",
+    "deploy_apply",
+    "verify",
 )
 
 StepStatus = Literal["PASSED", "FAILED", "UNRUN"]
@@ -146,6 +188,45 @@ class Decision(BaseModel):
     choice: str
     why: str = "foundry default"
     detail: str = ""
+
+
+class DeploymentResult(BaseModel):
+    """One translation's `arm_materialize.apply_expected_resources` outcome,
+    reduced to what a report needs - see `ArmApplyResult`'s own docstring for
+    exactly what each field means (`ok` true iff every MAPPED resource
+    reached a terminal success; `skipped_unmapped` is a coverage gap, not a
+    failure). `resource_group` is the EXACT name this translation's expected
+    estate was materialized under - the ResourceGroup row's own
+    `azure_logical_name` from `list_translation_resources`, never a
+    foundry-invented name (see `_expected_resource_group_name`) - and is the
+    same name the matching `VerificationResult` for this `translation_id`
+    carries, by construction."""
+
+    translation_id: int
+    resource_group: str
+    ok: bool
+    applied: int
+    skipped_unmapped: list[str] = Field(default_factory=list)
+    failures: list[dict[str, Any]] = Field(default_factory=list)
+    provisioning_timeouts: list[str] = Field(default_factory=list)
+
+
+class VerificationResult(BaseModel):
+    """One translation's `PrizmanyxClient.verify_translation` outcome,
+    recorded verbatim - Prizmanyx's own `VerifyResponse` counts and
+    `all_matched` verdict, never reworded or re-derived by this module.
+    `resource_group` is the same name `DeploymentResult.resource_group`
+    carries for this `translation_id` - the one `verify_translation` was
+    actually asked to diff."""
+
+    translation_id: int
+    resource_group: str
+    verification_run_id: int | None = None
+    all_matched: bool
+    matched_count: int
+    mismatch_count: int
+    missing_count: int
+    extra_count: int
 
 
 class LoopReport(BaseModel):
@@ -182,6 +263,8 @@ class LoopReport(BaseModel):
     unit_ids: list[int] = Field(default_factory=list)
     translation_ids: list[int] = Field(default_factory=list)
     artifact_paths: list[str] = Field(default_factory=list)
+    deployment_results: list[DeploymentResult] = Field(default_factory=list)
+    verification_results: list[VerificationResult] = Field(default_factory=list)
     started_at: datetime
     finished_at: datetime
 
@@ -261,6 +344,16 @@ class PipelineClient(Protocol):
         *,
         azure_subscription_id: str = "00000000-0000-0000-0000-000000000000",
         azure_resource_group: str = "foundry-preview-rg",
+    ) -> JSONObject: ...
+
+    def list_translation_resources(self, translation_id: int) -> JSONList: ...
+
+    def verify_translation(
+        self,
+        translation_id: int,
+        *,
+        azure_subscription_id: str,
+        azure_resource_group: str,
     ) -> JSONObject: ...
 
 
@@ -349,6 +442,45 @@ def _poll_translation_id(
     )
 
 
+def _expected_resource_group_name(resources: JSONList, translation_id: int) -> str:
+    """The ResourceGroup row's own `azure_logical_name` from
+    `list_translation_resources(translation_id)`'s output - the ONLY name
+    `deploy_apply` and `verify` may pass as `resource_group` for this
+    translation.
+
+    This is the RG-naming closure the round-trip depends on: the verify
+    bridge matches a deployed resource group's NAME against the
+    translator's own expected `ResourceGroup` `azure_logical_name` (see
+    `arm_materialize`'s own module docstring, contract edge 2). A
+    foundry-invented name here - even a deterministic one - would make
+    every resource in the group read as "missing" at verify, silently,
+    while `deploy_apply` itself could still report `ok`.
+    """
+    for resource in resources:
+        if resource.get("azure_resource_type") == _RESOURCE_GROUP_TOKEN:
+            name = resource.get("azure_logical_name")
+            if name:
+                return str(name)
+    raise LoopStepError(
+        "deploy_apply",
+        "missing_resource_group",
+        f"translation {translation_id}'s expected-resources carried no "
+        f"{_RESOURCE_GROUP_TOKEN!r} row to name the resource group after",
+    )
+
+
+def _floci_children_snapshot() -> set[str]:
+    """Every currently-RUNNING container whose name starts with `floci-`.
+
+    This module's OWN before/after snapshot around the whole `deploy_apply`
+    call for one translation - independent of, and in addition to,
+    `ArmApplyResult.spawned_children` (see `_persist_new_children`'s own
+    docstring for why both are unioned rather than trusting either alone).
+    """
+    result = run_docker(["ps", "--filter", _FLOCI_PS_FILTER, "--format", "{{.Names}}"])
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
 def run_loop(
     env: EnvState,
     client: PipelineClient,
@@ -356,6 +488,7 @@ def run_loop(
     worker_host: str = DEFAULT_WORKER_HOST,
     translation_poll_max_attempts: int = _TRANSLATION_POLL_MAX_ATTEMPTS,
     translation_poll_interval: float = _TRANSLATION_POLL_INTERVAL_SECONDS,
+    materialize: ArmMaterializeFn = apply_expected_resources,
 ) -> LoopReport:
     """Walk `env`'s estate through Prizmanyx's pipeline via `client`, and
     return a full `LoopReport` - PASS or FAIL, but always a report, never a
@@ -364,6 +497,12 @@ def run_loop(
     `worker_host` is passed straight to `worker_reachable_endpoint` for the
     `register_env_connection` call - see that function's own docstring for
     why this can't just be `env`'s own `localhost` address.
+
+    `materialize` is the `deploy_apply` step's own injectable seam (see
+    `ArmMaterializeFn`) - defaults to the real
+    `arm_materialize.apply_expected_resources`, overridable so tests can
+    drive `deploy_apply` with no network/docker, exactly like `client`
+    already lets every other step be driven with no network at all.
     """
     started_at = datetime.now(UTC)
     steps: dict[str, StepResult] = {
@@ -376,8 +515,44 @@ def run_loop(
     unit_ids: list[int] = []
     translation_ids: list[int] = []
     artifact_paths: list[str] = []
+    deployment_results: list[DeploymentResult] = []
+    verification_results: list[VerificationResult] = []
+    # Populated by `deploy_apply` as each translation's expected resource
+    # group name is read off its own `list_translation_resources` output -
+    # `verify` reuses these EXACT values rather than re-deriving them, so
+    # the two steps can never drift apart on what "this translation's
+    # resource group" means (the RG-naming closure `_expected_resource_group_
+    # name` documents).
+    translation_resource_groups: dict[int, str] = {}
+    # The ownership-by-recording set this run's own `deploy_apply` has
+    # confirmed spawned in floci-az so far - seeded from whatever `env`
+    # already carries (a prior run against the same environment), so a
+    # second `deploy_apply` batch never loses track of the first's
+    # children. Persisted after EVERY translation's materialize attempt,
+    # success or failure or crash (see `_persist_new_children`), never
+    # batched to the end of the step.
+    known_children: set[str] = set(env.children or [])
     failed_step: str | None = None
     failure_detail: str | None = None
+
+    def _persist_new_children(new_children: set[str]) -> None:
+        """Union `new_children` into `known_children` and persist `env`
+        (with `children` updated) to disk immediately, if there is anything
+        new to record.
+
+        Called after EVERY `deploy_apply` materialize attempt for one
+        translation - including one that raised, per carry #2 of Task 3's
+        review (a transport error mid-materialize can propagate before
+        `arm_materialize`'s OWN before/after snapshot completes, which
+        would otherwise orphan whatever floci-az child a partial PUT batch
+        already spawned). Mirrors `tf_runner.apply_in_dir`'s own
+        union-not-overwrite persistence exactly, so `engine.remove_env`
+        reaps these the same way it reaps the AWS side's children.
+        """
+        if not new_children:
+            return
+        known_children.update(new_children)
+        state.save_state(env.model_copy(update={"children": sorted(known_children)}))
 
     def _step(name: str, fn: Callable[[], _T]) -> _T:
         nonlocal failed_step, failure_detail
@@ -498,6 +673,92 @@ def run_loop(
 
         _step("deploy_preview", _deploy_every_translation_preview)
 
+        def _deploy_apply_one(translation_id: int) -> None:
+            resources = client.list_translation_resources(translation_id)
+            resource_group = _expected_resource_group_name(resources, translation_id)
+            translation_resource_groups[translation_id] = resource_group
+            az_base_url = f"http://localhost:{env.ports['az']}"
+
+            before = _floci_children_snapshot()
+            result: ArmApplyResult | None = None
+            try:
+                result = materialize(
+                    az_base_url, _AZ_PLACEHOLDER_SUBSCRIPTION_ID, resource_group, resources
+                )
+            finally:
+                # Runs whether `materialize` returned normally OR raised -
+                # carry #2: a transport error mid-materialize can propagate
+                # BEFORE arm_materialize's own before/after snapshot
+                # completes, so this module's OWN snapshot, taken around the
+                # whole call, is what keeps a crash from orphaning whatever
+                # floci-az child a partial PUT batch already spawned.
+                # Unioned with the materializer's own reported
+                # `spawned_children` (when it did return) rather than
+                # trusting either alone.
+                after = _floci_children_snapshot()
+                reported = set(result.spawned_children) if result is not None else set()
+                _persist_new_children((after - before) | reported)
+
+            assert result is not None  # the `finally` above re-raises otherwise
+            deployment_results.append(
+                DeploymentResult(
+                    translation_id=translation_id,
+                    resource_group=resource_group,
+                    ok=result.ok,
+                    applied=result.applied,
+                    skipped_unmapped=result.skipped_unmapped,
+                    failures=result.failures,
+                    provisioning_timeouts=result.provisioning_timeouts,
+                )
+            )
+            if not result.ok:
+                raise LoopStepError(
+                    "deploy_apply",
+                    "materialize_failed",
+                    f"translation {translation_id} (resource_group={resource_group!r}): "
+                    f"failures={result.failures!r} "
+                    f"provisioning_timeouts={result.provisioning_timeouts!r}",
+                )
+
+        def _deploy_every_translation_apply() -> None:
+            for translation_id in translation_ids:
+                _deploy_apply_one(translation_id)
+
+        _step("deploy_apply", _deploy_every_translation_apply)
+
+        def _verify_one(translation_id: int) -> None:
+            resource_group = translation_resource_groups[translation_id]
+            raw = client.verify_translation(
+                translation_id,
+                azure_subscription_id=_AZ_PLACEHOLDER_SUBSCRIPTION_ID,
+                azure_resource_group=resource_group,
+            )
+            result = VerificationResult(
+                translation_id=translation_id,
+                resource_group=resource_group,
+                verification_run_id=raw.get("verification_run_id"),
+                all_matched=bool(raw.get("all_matched")),
+                matched_count=int(raw.get("matched_count") or 0),
+                mismatch_count=int(raw.get("mismatch_count") or 0),
+                missing_count=int(raw.get("missing_count") or 0),
+                extra_count=int(raw.get("extra_count") or 0),
+            )
+            verification_results.append(result)
+            if not result.all_matched:
+                raise LoopStepError(
+                    "verify",
+                    "not_all_matched",
+                    f"translation {translation_id} (resource_group={resource_group!r}): "
+                    f"matched={result.matched_count} missing={result.missing_count} "
+                    f"extra={result.extra_count} mismatch={result.mismatch_count}",
+                )
+
+        def _verify_every_translation() -> None:
+            for translation_id in translation_ids:
+                _verify_one(translation_id)
+
+        _step("verify", _verify_every_translation)
+
     except LoopStepError:
         pass  # already recorded by _step; every later STEP_ORDER entry stays UNRUN
 
@@ -516,6 +777,8 @@ def run_loop(
         unit_ids=unit_ids,
         translation_ids=translation_ids,
         artifact_paths=artifact_paths,
+        deployment_results=deployment_results,
+        verification_results=verification_results,
         started_at=started_at,
         finished_at=datetime.now(UTC),
     )

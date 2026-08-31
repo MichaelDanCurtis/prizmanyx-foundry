@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from foundry.loop import Decision, LoopReport, StepResult
+from foundry.loop import Decision, DeploymentResult, LoopReport, StepResult, VerificationResult
 
 REPORT_MD_FILENAME = "report.md"
 REPORT_JSON_FILENAME = "report.json"
@@ -20,12 +20,21 @@ REPORT_JSON_FILENAME = "report.json"
 # The spec's As-decided fidelity trade (`docs/superpowers/specs/
 # 2026-08-30-floci-cloud-testing-design.md`'s Track A/Track B split), carried
 # verbatim into every report header so reading ONE report.md is enough to
-# know what deploy-preview does and does not prove - never left implicit,
-# never only in a spec a reader of this file may not have open.
+# know what each of `deploy_preview`/`deploy_apply`/`verify` does and does
+# not prove - never left implicit, never only in a spec a reader of this
+# file may not have open. Rewritten for slice 4 (Task 5): `deploy_preview`
+# still only exercises Prizmanyx's own Pulumi deployer against emulated
+# Azure - it never applies. `deploy_apply` is the foundry's OWN ARM
+# materializer (`arm_materialize.apply_expected_resources`), not Pulumi's
+# apply - a deliberate fidelity trade, stated rather than implied. `verify`
+# is Prizmanyx's REAL ARM bridge (`PrizmanyxClient.verify_translation`), but
+# STRUCTURAL only - existence, type, and name, not property-depth (that is
+# Phase 6, not this slice).
 FIDELITY_LINE = (
-    "deploy-preview exercises Prizmanyx's own Pulumi deployer; "
-    "apply-beyond-preview against emulated Azure is not part of slice 3 "
-    "(awaits the ARM adapter, Track B)."
+    "deploy_preview exercises Prizmanyx's own Pulumi deployer (never applies); "
+    "deploy_apply is the foundry's own ARM materializer into emulated Azure, "
+    "NOT Pulumi's apply; verify is Prizmanyx's real ARM bridge, but STRUCTURAL "
+    "only - existence/type/name, not property-depth (Phase 6)."
 )
 
 
@@ -63,6 +72,23 @@ def _render_decision_row(decision: Decision) -> str:
     return (
         f"| {decision.step} | {decision.choice} | {decision.why} "
         f"| {_escape_cell(decision.detail)} |"
+    )
+
+
+def _render_deployment_row(deployment: DeploymentResult) -> str:
+    return (
+        f"| {deployment.translation_id} | {deployment.resource_group} | {deployment.ok} "
+        f"| {deployment.applied} | {len(deployment.skipped_unmapped)} "
+        f"| {len(deployment.failures)} | {len(deployment.provisioning_timeouts)} |"
+    )
+
+
+def _render_verification_row(verification: VerificationResult) -> str:
+    return (
+        f"| {verification.translation_id} | {verification.resource_group} "
+        f"| {verification.all_matched} | {verification.matched_count} "
+        f"| {verification.mismatch_count} | {verification.missing_count} "
+        f"| {verification.extra_count} |"
     )
 
 
@@ -110,6 +136,27 @@ def render_markdown(report: LoopReport) -> str:
         "## Artifacts",
         "",
         *([f"- {path}" for path in report.artifact_paths] or ["(none)"]),
+        "",
+        "## Deployments (deploy_apply)",
+        "",
+        "Each row is one translation's `arm_materialize.apply_expected_resources`",
+        "outcome - `ok` true iff every MAPPED resource reached a terminal success.",
+        "`skipped_unmapped` is a coverage gap (surfaces as `missing` at verify",
+        "below), not a failure of the apply itself.",
+        "",
+        "| Translation | Resource group | OK | Applied | Skipped (unmapped) "
+        "| Failures | Provisioning timeouts |",
+        "|---|---|---|---|---|---|---|",
+        *(_render_deployment_row(deployment) for deployment in report.deployment_results),
+        "",
+        "## Verification (verify)",
+        "",
+        "Each row is Prizmanyx's own `verify_translation` verdict, recorded",
+        "verbatim - STRUCTURAL only (existence/type/name, not property-depth).",
+        "",
+        "| Translation | Resource group | All matched | Matched | Mismatch | Missing | Extra |",
+        "|---|---|---|---|---|---|---|",
+        *(_render_verification_row(verification) for verification in report.verification_results),
         "",
     ]
     return "\n".join(lines)
