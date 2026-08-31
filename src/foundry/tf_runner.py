@@ -102,9 +102,49 @@ def _write_main_tf(env: EnvState) -> Path:
     return env_dir
 
 
+def apply_in_dir(env: EnvState, env_dir: Path) -> ApplyResult:
+    """Run terraform init+apply against an ALREADY-PREPARED `env_dir`, and
+    record what it spawned into `env.children`.
+
+    Split out of `apply` so a caller that prepared the terraform workdir
+    some OTHER way can still take this exact path rather than a lookalike
+    of it. `from_repo.materialize_from_repo` is that caller: it copies a
+    cloned repo's own `.tf` files into the env dir and must not have them
+    overwritten by `apply`'s own `_write_main_tf` (which re-renders main.tf
+    from `env.spec_path`). One copy of the init/apply/transcript/children
+    logic, two entry points - see `apply`'s docstring for what that logic
+    guarantees.
+    """
+    before = _running_floci_container_names()
+    init_ok, init_output = _run_terraform(env_dir, "init")
+    if init_ok:
+        apply_ok, apply_output = _run_terraform(env_dir, "apply", "-auto-approve")
+    else:
+        apply_ok, apply_output = False, "(skipped: terraform init failed)"
+    after = _running_floci_container_names()
+
+    transcript_path = env_dir / _APPLY_TRANSCRIPT_FILENAME
+    transcript_path.write_text(
+        f"$ terraform init\n{init_output}\n\n$ terraform apply -auto-approve\n{apply_output}\n"
+    )
+
+    new_children = after - before
+    combined_children = sorted(set(env.children or []) | new_children)
+    state.save_state(env.model_copy(update={"children": combined_children}))
+
+    ok = init_ok and apply_ok
+    resources_applied = _parse_resources_summary(apply_output) if ok else 0
+    return ApplyResult(ok=ok, resources_applied=resources_applied, transcript_path=transcript_path)
+
+
 def apply(env: EnvState) -> ApplyResult:
     """Materialize `env`'s spec as Terraform and apply it against its own
     floci endpoint.
+
+    Two steps, deliberately separable: `_write_main_tf` renders the spec
+    into the env dir, then `apply_in_dir` runs terraform there and records
+    what it spawned. Everything below describes that second step, which
+    `from_repo` reaches directly with a workdir it prepared itself.
 
     Ownership-by-recording: `docker ps` (running, `floci-`-prefixed) is
     snapshotted immediately before and immediately after the real
@@ -127,28 +167,7 @@ def apply(env: EnvState) -> ApplyResult:
     `select_children_to_reap`'s own created_at heuristic already lives
     with, for a related but distinct reason.
     """
-    env_dir = _write_main_tf(env)
-
-    before = _running_floci_container_names()
-    init_ok, init_output = _run_terraform(env_dir, "init")
-    if init_ok:
-        apply_ok, apply_output = _run_terraform(env_dir, "apply", "-auto-approve")
-    else:
-        apply_ok, apply_output = False, "(skipped: terraform init failed)"
-    after = _running_floci_container_names()
-
-    transcript_path = env_dir / _APPLY_TRANSCRIPT_FILENAME
-    transcript_path.write_text(
-        f"$ terraform init\n{init_output}\n\n$ terraform apply -auto-approve\n{apply_output}\n"
-    )
-
-    new_children = after - before
-    combined_children = sorted(set(env.children or []) | new_children)
-    state.save_state(env.model_copy(update={"children": combined_children}))
-
-    ok = init_ok and apply_ok
-    resources_applied = _parse_resources_summary(apply_output) if ok else 0
-    return ApplyResult(ok=ok, resources_applied=resources_applied, transcript_path=transcript_path)
+    return apply_in_dir(env, _write_main_tf(env))
 
 
 def destroy(env: EnvState) -> ApplyResult:

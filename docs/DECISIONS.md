@@ -28,9 +28,11 @@ how a foundry loop registers its environment (the
 `packages/api/prizmanyx_api/app.py:2568`,
 `packages/api/prizmanyx_api/aws_connect_store.py`'s
 `upsert_localstack_connection`, the only connection-creation path that ever
-writes a non-null `endpoint_url`). The spike explicitly flagged this SDK
-path as "not tested" and left it as the swing fact for this foundry's loop
-design (Task 6). This entry closes that gap.
+writes a non-null `endpoint_url`). The spike never exercised that SDK path:
+it listed the path under its own "Not attempted (for controller
+adjudication)" section, flagged for a follow-up task, having only READ
+`shapers.py` rather than run it. That left it the swing fact for this
+foundry's loop design (Task 6). This entry closes that gap.
 
 **Method.** From this repo (skeleton only at this point — no environment
 engine exists yet), by hand:
@@ -127,3 +129,79 @@ name=floci- -q | xargs docker rm -f`. Verified empty afterward (`docker ps
 -a --filter name=floci-` — zero rows) and confirmed the untouchable compose
 stack (`prizmanyx-localstack`, `-azurite`, `-postgres`, `-temporal*`,
 `-minio`, `-grafana`, `-prometheus`) unaffected throughout.
+
+---
+
+## 002 — from-repo acceptance runs against the foundry's OWN examples/aws-mini, not prizmanyx-testbed
+
+**Date:** 2026-08-31
+
+**Question.** The Floci cloud-testing design
+(`docs/superpowers/specs/2026-08-30-floci-cloud-testing-design.md:130-135`,
+Prizmanyx repo) describes `from-repo <https-url>` as the path by which
+"`prizmanyx-testbed` becomes simply the first such repo". Task 5 needs a
+LIVE acceptance case for that path. Is the testbed that case today?
+
+**Method.** Checked the repository itself rather than the design's intent —
+a shallow clone of `https://github.com/MichaelDanCurtis/prizmanyx-testbed`
+(HEAD `b605b22cdfb5fa1dff5dae616d1e3a8a45279487`, "prizmanyx-testbed: an AWS
+app built to be migrated", 2026-08-13), read-only, deleted afterward.
+
+**Finding.** **Zero `.tf` files.** Its entire tracked file set is four `.py`,
+one `.sh`, one `.md`, one `.gitignore`, and one `.yaml` — and that YAML,
+`infra/core.yaml`, is a **CloudFormation** template (`AWSTemplateFormatVersion:
+"2010-09-09"`, 114 lines), deliberately carrying planted declared-vs-live
+mismatches for Prizmanyx's reconcile surface. This matches what the foundry
+plan carried forward from the 2026-08-25 slice-2 live proof, and sharpens
+it: the testbed does not merely *lack* terraform pending a small addition —
+its IaC is written in a different language, so "a terraform mirror in the
+testbed" is new authoring work, not a port of something already there.
+
+**Decision.** Until such a mirror exists, the from-repo acceptance case is
+**the foundry's own `examples/aws-mini`**, applied through the real path:
+`foundry create <name> --from-repo
+https://github.com/MichaelDanCurtis/prizmanyx-foundry --path
+examples/aws-mini`. That fixture is 1 vpc + 1 subnet + 1 S3 bucket + 1 SQS
+queue and — deliberately — declares **no provider block of its own**, which
+is the exact shape the injected `override.tf` is designed for. The
+acceptance test (`tests/test_from_repo.py`, `@pytest.mark.docker`) clones
+the pushed repo over the network for real, applies it against a live floci
+environment, and verifies the bucket and queue host-side via boto3.
+
+This is a self-referential acceptance case, and that is worth naming
+honestly: the repo proves it can apply *its own* terraform. What it does
+NOT yet prove is that an arbitrary third-party repo's terraform applies
+cleanly — that needs a repo nobody here authored. The mechanism under test
+(clone → subtree select → override injection → the same `apply_in_dir` a
+spec-based environment uses) is identical either way; the fixture's
+provenance is the only thing this case cannot speak to.
+
+**Two design facts this path depends on, recorded because they are not
+obvious from the code alone:**
+
+1. **Terraform's override semantics reach the DEFAULT provider only.**
+   `override.tf` merges into `provider "aws" {}`; a cloned repo that also
+   declares *aliased* aws providers (`provider "aws" { alias = "west" }`)
+   keeps those pointed wherever the repo pointed them. A repo built that way
+   would have part of its estate attempt real AWS endpoints. Not mitigated
+   today — stated, not silently inherited.
+2. **A repo carrying its own override file is refused, not merged.**
+   Terraform reads `override.tf` and every `*_override.tf` in the working
+   directory, applying them in filename order with the last winning. A repo
+   shipping `override.tf` would have foundry's write clobber it; one
+   shipping e.g. `zzz_override.tf` would silently out-precedence foundry's
+   endpoint injection — pointing the apply somewhere other than this
+   environment's floci. `from_repo._reject_conflicting_override_files`
+   refuses both up front, by name.
+
+**Also settled here (mirroring, not inventing):** the URL rule is Prizmanyx's
+own clone-seam rule, both halves —
+`packages/analysis-harness/prizmanyx_analysis_harness/clone.py`'s
+`CloneRequest.__post_init__`, the check `convention_ingest.py`'s
+`clone_scan_parse_terraform` relies on. https-only, with that file's exact
+message text ("Only https git URLs are supported"), and no credentials
+embedded in the URL — the second half matters here for the same literal
+reason it does there, since this URL becomes `git clone <url>` argv. Clones
+are transient (made in a temp dir inside the env's own 0o700 state
+directory, removed on the way out, success or failure), which is the same
+discipline `clone_scan_parse_terraform` applies to its own.

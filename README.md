@@ -36,19 +36,43 @@ These are load-bearing and apply to every line of code added to this repo:
 
 ## Status
 
-Repo bootstrap only. The CLI currently exposes one command:
+The environment engine, EnvSpec (hand-written and seeded-random), both
+materializers (spec and from-repo) and the lifecycle commands exist. The
+Prizmanyx pipeline client and the loop driver (`foundry run`) are later
+slices — see the plan this repo is being built from (tracked in the
+Prizmanyx repo's
+`docs/superpowers/plans/2026-08-30-foundry-slices-1-3.md`) for the full
+slice breakdown, and `docs/DECISIONS.md` for the probe results and design
+calls they build on.
 
 ```bash
 uv sync
+
 uv run foundry version
+
+# Create an environment and materialize an estate in it — one of three sources:
+uv run foundry create demo --spec examples/specs/small.yaml
+uv run foundry create demo --random S --seed 42
+uv run foundry create demo \
+  --from-repo https://github.com/MichaelDanCurtis/prizmanyx-foundry \
+  --path examples/aws-mini
+
+uv run foundry ls          # every tracked environment, with LIVE container status
+uv run foundry rm demo     # container, attributable children, state dir
 ```
 
-The environment engine, EnvSpec, materializers, the Prizmanyx pipeline
-client, and the loop driver are later slices — see
-`docs/DECISIONS.md` for the probe result they build on, and the plan this
-repo is being built from (tracked in the Prizmanyx repo's
-`docs/superpowers/plans/2026-08-30-foundry-slices-1-3.md`) for the full slice
-breakdown.
+`--from-repo` clones any https git repository and applies **its** terraform
+at **this** environment's floci endpoints, by injecting an `override.tf`
+carrying the same provider/endpoints block a spec-based environment gets.
+`examples/aws-mini` is this repo's own acceptance fixture for that path —
+see `docs/DECISIONS.md` entry 002 for why the acceptance case is
+self-referential today, and for the two override-semantics limits it
+inherits.
+
+Terraform and git are invoked as **external tools** — the terraform CLI runs
+in a pinned throwaway container (`hashicorp/terraform:1.9`) and is never
+vendored or shipped by this repo. That matters: the terraform CLI is
+BUSL-1.1, and only invocation, not distribution, is in scope here.
 
 ## Design provenance
 
