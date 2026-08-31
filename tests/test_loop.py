@@ -762,6 +762,99 @@ def test_the_resource_group_name_used_is_the_expected_resources_rg_row_not_a_fou
     assert report.verification_results[0].resource_group == "unit-42-prod-rg"
 
 
+def test_no_resource_group_row_fails_deploy_apply_and_leaves_verify_unrun():
+    # `_expected_resource_group_name` raises LoopStepError("deploy_apply",
+    # "missing_resource_group", ...) when the expected-resources list
+    # carries no ResourceGroup row at all - a translator/codegen bug, not
+    # something deploy_apply should paper over by inventing a name.
+    client = _FakeClient(
+        expected_resources={
+            101: [
+                {
+                    "azure_resource_type": "azure_native.storage.StorageAccount",
+                    "azure_logical_name": "sa1",
+                    "azure_properties": {},
+                }
+            ]
+        },
+        units=[{"id": 1}],
+    )
+    calls: list[tuple[str, str, str, list[dict[str, object]]]] = []
+
+    def _materialize(az_base_url, subscription_id, resource_group, resources):
+        calls.append((az_base_url, subscription_id, resource_group, resources))
+        return ArmApplyResult(
+            ok=True,
+            applied=1,
+            skipped_unmapped=[],
+            failures=[],
+            provisioning_timeouts=[],
+            spawned_children=[],
+        )
+
+    report = _run(_env(), client, materialize=_materialize)
+
+    assert report.verdict == "FAIL"
+    assert report.failed_step == "deploy_apply"
+    assert "101" in report.failure_detail
+    assert "ResourceGroup" in report.failure_detail
+
+    statuses = _step_statuses(report)
+    assert statuses["deploy_apply"] == "FAILED"
+    assert statuses["verify"] == "UNRUN"
+
+    # materialize was never called at all - the RG lookup fails before any
+    # PUT could be attempted, and no deployment/verification result exists
+    # for this translation.
+    assert calls == []
+    assert report.deployment_results == []
+    assert report.verification_results == []
+
+
+def test_two_resource_group_rows_the_first_ones_name_wins():
+    # First match wins (deliberate, per _expected_resource_group_name's own
+    # docstring) - codegen emits exactly one RG scaffold per unit, so a
+    # second row is not an expected shape this needs to detect or reject.
+    client = _FakeClient(
+        expected_resources={
+            101: [
+                {
+                    "azure_resource_type": "azure_native.resources.ResourceGroup",
+                    "azure_logical_name": "rg-first",
+                    "azure_properties": {},
+                },
+                {
+                    "azure_resource_type": "azure_native.resources.ResourceGroup",
+                    "azure_logical_name": "rg-second",
+                    "azure_properties": {},
+                },
+            ]
+        },
+        units=[{"id": 1}],
+    )
+    calls: list[tuple[str, str, str, list[dict[str, object]]]] = []
+
+    def _materialize(az_base_url, subscription_id, resource_group, resources):
+        calls.append((az_base_url, subscription_id, resource_group, resources))
+        return ArmApplyResult(
+            ok=True,
+            applied=1,
+            skipped_unmapped=[],
+            failures=[],
+            provisioning_timeouts=[],
+            spawned_children=[],
+        )
+
+    report = _run(_env(), client, materialize=_materialize)
+
+    assert report.verdict == "PASS"
+    assert len(calls) == 1
+    assert calls[0][2] == "rg-first"
+    assert report.deployment_results[0].resource_group == "rg-first"
+    assert report.verification_results[0].resource_group == "rg-first"
+    assert client.verify_requests == [(101, "00000000-0000-0000-0000-000000000000", "rg-first")]
+
+
 def test_spawned_children_from_deploy_apply_are_persisted_into_env_state():
     # Carry #2 (mandatory, Task 3's review): union, like the AWS side
     # (tf_runner.apply_in_dir), so engine.remove_env can reap them later.

@@ -455,6 +455,11 @@ def _expected_resource_group_name(resources: JSONList, translation_id: int) -> s
     foundry-invented name here - even a deterministic one - would make
     every resource in the group read as "missing" at verify, silently,
     while `deploy_apply` itself could still report `ok`.
+
+    First match wins: codegen emits exactly one `ResourceGroup` scaffold
+    per migration unit, so a second row is not an expected shape this
+    function needs to detect or reject - it is a deliberate "pick the
+    first" choice, not an accidental one.
     """
     for resource in resources:
         if resource.get("azure_resource_type") == _RESOURCE_GROUP_TOKEN:
