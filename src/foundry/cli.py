@@ -173,6 +173,17 @@ def create_command(
             help="Subdirectory of --from-repo's repository to apply (default: its root).",
         ),
     ] = None,
+    no_azure: Annotated[
+        bool,
+        typer.Option(
+            "--no-azure",
+            help=(
+                "Skip the floci-az (Azure ARM) container - AWS-only. Azure is on by "
+                "default so the deploy+verify loop works out of the box; only one "
+                "Azure-enabled environment can exist at a time (fixed host port)."
+            ),
+        ),
+    ] = False,
 ) -> None:
     """Create an environment and materialize an estate in it."""
     try:
@@ -181,11 +192,14 @@ def create_command(
         raise _fail(str(exc)) from exc
 
     try:
-        env = create_env(name, env_spec, seed=resolved_seed)
+        env = create_env(name, env_spec, seed=resolved_seed, with_azure=not no_azure)
     except _OPERATOR_ERRORS as exc:
         raise _fail(str(exc)) from exc
 
-    typer.echo(f"created {env.name} (aws endpoint: http://localhost:{env.ports['aws']})")
+    endpoints = f"aws endpoint: http://localhost:{env.ports['aws']}"
+    if "az" in env.ports:
+        endpoints += f", az endpoint: http://localhost:{env.ports['az']}"
+    typer.echo(f"created {env.name} ({endpoints})")
 
     try:
         if from_repo is not None:

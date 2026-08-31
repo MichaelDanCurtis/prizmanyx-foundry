@@ -576,7 +576,7 @@ def _force_cleanup(env_name: str) -> None:
 @pytest.mark.docker
 def test_materialize_from_repo_against_the_foundrys_own_repo_applies_clean():
     try:
-        env = create_env(ENV_NAME_FROM_REPO, placeholder_spec(ENV_NAME_FROM_REPO))
+        env = create_env(ENV_NAME_FROM_REPO, placeholder_spec(ENV_NAME_FROM_REPO), with_azure=False)
         port = env.ports["aws"]
 
         result = materialize_from_repo(env, FOUNDRY_REPO_URL, path="examples/aws-mini")

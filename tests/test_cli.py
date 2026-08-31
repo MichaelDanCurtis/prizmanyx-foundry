@@ -52,10 +52,14 @@ class _RecordingCreateEnv:
 
     def __init__(self, result: EnvState | None = None):
         self.calls: list[tuple[str, EnvSpec, int | None]] = []
+        self.with_azure_flags: list[bool] = []
         self._result = result or _env()
 
-    def __call__(self, name: str, spec: EnvSpec, *, seed: int | None = None) -> EnvState:
+    def __call__(
+        self, name: str, spec: EnvSpec, *, seed: int | None = None, with_azure: bool = True
+    ) -> EnvState:
         self.calls.append((name, spec, seed))
+        self.with_azure_flags.append(with_azure)
         return self._result
 
 
@@ -152,6 +156,23 @@ def test_create_from_random_seeds_the_generator_and_records_the_seed(monkeypatch
     # the generator rather than inventing a spec of its own.
     assert spec.name_prefix == "foundry-s-42"
     assert "10" in result.output
+    # Azure is ON by default (no --no-azure) so slice-4 loops work out of the box.
+    assert create_env.with_azure_flags == [True]
+
+
+def test_create_no_azure_flag_skips_the_azure_container(monkeypatch, tmp_path):
+    # `--no-azure` is the AWS-only escape hatch for demos that don't need the
+    # floci-az plane (and must not contend for its fixed host port).
+    create_env = _RecordingCreateEnv()
+    monkeypatch.setattr(cli, "create_env", create_env)
+    monkeypatch.setattr(cli, "apply", lambda *_: _ok_apply(tmp_path))
+
+    result = runner.invoke(
+        cli.app, ["create", "demo", "--random", "S", "--seed", "1", "--no-azure"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert create_env.with_azure_flags == [False]
 
 
 def test_create_from_spec_loads_that_file_and_applies_it(monkeypatch, tmp_path):
@@ -262,7 +283,7 @@ def test_create_reports_a_failed_apply_as_a_nonzero_exit_and_names_the_transcrip
 
 
 def test_create_surfaces_an_engine_failure_as_a_message_not_a_traceback(monkeypatch):
-    def _boom(name, spec, *, seed=None):  # noqa: ARG001
+    def _boom(name, spec, *, seed=None, with_azure=True):  # noqa: ARG001
         raise EnvStartError("container 'floci-demo' did not become healthy within 60.0s")
 
     monkeypatch.setattr(cli, "create_env", _boom)

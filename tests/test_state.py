@@ -57,6 +57,22 @@ def test_save_then_load_round_trips_exactly():
     assert load_state("demo") == original
 
 
+def test_save_then_load_round_trips_a_state_carrying_an_az_port():
+    # Slice 4: an Azure-enabled environment records the floci-az host port
+    # under `ports["az"]` (the key state.py's docstring reserved) alongside
+    # `ports["aws"]`. The whole state must persist and reload byte-for-byte
+    # - `az` is not special-cased anywhere in the schema, it is just another
+    # entry in the open `ports` map, and this pins that it survives the
+    # round trip.
+    original = _sample_state(name="az-enabled", ports={"aws": 15600, "az": 14577})
+    save_state(original)
+
+    loaded = load_state("az-enabled")
+
+    assert loaded == original
+    assert loaded.ports == {"aws": 15600, "az": 14577}
+
+
 def test_save_state_creates_a_0700_directory():
     saved_path = save_state(_sample_state())
     mode = stat.S_IMODE(saved_path.parent.stat().st_mode)

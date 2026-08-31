@@ -237,7 +237,7 @@ def test_apply_then_destroy_round_trips_resources_via_boto3():
         buckets=[BucketSpec(name_hint="app-data", count=1)],
     )
     try:
-        env = create_env(ENV_NAME_APPLY, spec)
+        env = create_env(ENV_NAME_APPLY, spec, with_azure=False)
         port = env.ports["aws"]
 
         result = apply(env)
@@ -290,7 +290,7 @@ def test_remove_env_reaps_a_still_running_recorded_child():
         instances=[InstanceSpec(subnet_index=0, instance_type="t3.micro", count=1)],
     )
     try:
-        env = create_env(ENV_NAME_REAP, spec)
+        env = create_env(ENV_NAME_REAP, spec, with_azure=False)
 
         result = apply(env)
         assert result.ok, result.transcript_path.read_text()

@@ -107,9 +107,11 @@ def state_file(name: str) -> Path:
 class EnvState(BaseModel):
     """Everything the engine persists about one environment.
 
-    `ports` maps service name to allocated host port (`{"aws": 15600}`
-    today; the key space is deliberately open for a future `"az"` entry
-    once floci-az joins the engine). `spec_path` points at the copy of the
+    `ports` maps service name to host port. An AWS-only environment carries
+    just `{"aws": 15600}`; an Azure-enabled one also carries `{"az": 14577}`
+    (the fixed floci-az port - see `engine.floci_az_port`). The key space
+    stays open; `az` is not special-cased in the schema, just another entry.
+    `spec_path` points at the copy of the
     EnvSpec `create_env` wrote into this environment's own directory, not
     the caller's original file, so the environment's record stays
     self-contained even if the caller's original spec file later moves or

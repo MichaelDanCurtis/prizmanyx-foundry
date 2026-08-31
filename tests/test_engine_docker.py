@@ -50,12 +50,15 @@ from foundry.engine import (
     PORT_RANGE_END,
     PORT_RANGE_START,
     ContainerRow,
+    EngineError,
     RemovalReport,
     _parse_docker_ps_output,
     allocate_port,
+    az_container_name,
     container_name,
     create_env,
     env_status,
+    floci_az_port,
     remove_env,
     select_children_to_reap,
 )
@@ -267,6 +270,28 @@ def test_select_children_to_reap_spares_a_peer_whose_name_collides_with_child_pr
 
     assert selection.reap == [], "a live peer's own parent container must never be reaped"
     assert [row.name for row in selection.spare] == ["floci-rds-x"]
+
+
+def test_select_children_to_reap_spares_a_peers_az_parent_container_case_c():
+    # Case C (slice 4): a live peer's Azure control-plane container is named
+    # `floci-az-<peer>`. It is NOT one of CHILD_NAME_PREFIXES, but it DOES
+    # match the `docker ps --filter name=floci-` sweep, so it lands in the
+    # candidate rows - and it is a live peer's own parent container, exactly
+    # like the AWS parent case B guards. Its name is added to the spare set
+    # (`other_parent_names`) alongside the AWS parent, so it is reported as
+    # spared and never reaped, whatever its timestamp. Without that guard a
+    # peer's Azure plane could be torn out from under it when any AWS-only
+    # env beside it is removed.
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    target = _env("target", t0)
+    peer = _env("peer", t0 + timedelta(minutes=1))
+    az_parent_row = _row(az_container_name("peer"), t0 + timedelta(minutes=5))
+    assert az_parent_row.name == "floci-az-peer", "the naming this test exercises"
+
+    selection = select_children_to_reap([az_parent_row], target, [target, peer])
+
+    assert selection.reap == [], "a live peer's az parent container must never be reaped"
+    assert [row.name for row in selection.spare] == ["floci-az-peer"]
 
 
 def test_select_children_to_reap_auto_reaps_nothing_once_two_environments_are_alive():
@@ -518,6 +543,128 @@ def test_parse_docker_ps_output_handles_empty_stdout():
     assert unparsed == []
 
 
+# --- env_status: merging the AWS and Azure container healths ---------------
+
+
+def _fake_inspect_docker(healths: dict[str, str]):
+    """A `run_docker` double that answers `inspect --format ...` with the
+    canned health for the container named last in the args, and refuses any
+    other call - so a test can prove exactly which containers env_status
+    inspected."""
+
+    def _fake(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["inspect", "--format"]:
+            container = args[-1]
+            if container not in healths:
+                raise AssertionError(f"env_status inspected an unexpected container {container!r}")
+            return subprocess.CompletedProcess(args, 0, stdout=f"{healths[container]}\n", stderr="")
+        raise AssertionError(f"env_status made an unexpected docker call {args!r}")
+
+    return _fake
+
+
+@pytest.mark.parametrize(
+    ("aws_health", "az_health", "expected"),
+    [
+        ("healthy", "healthy", "healthy"),
+        ("healthy", "starting", "az:starting"),
+        ("unhealthy", "healthy", "aws:unhealthy"),
+        ("not_found", "unhealthy", "aws:not_found az:unhealthy"),
+    ],
+)
+def test_env_status_merges_both_container_healths(
+    tmp_path, monkeypatch, aws_health, az_health, expected
+):
+    # Both healthy collapses to a plain "healthy"; otherwise the merged
+    # status NAMES the unhealthy plane(s) so `foundry ls` can point at the
+    # container at fault rather than a bare "unhealthy" that hides which of
+    # the two broke.
+    az_env = _env("azenv", datetime(2026, 1, 1, tzinfo=UTC)).model_copy(
+        update={"ports": {"aws": 15600, "az": 14577}}
+    )
+    monkeypatch.setattr(state, "ENVS_DIR", tmp_path / "envs")
+    state.save_state(az_env)
+    monkeypatch.setattr(
+        "foundry.engine.run_docker",
+        _fake_inspect_docker({"floci-azenv": aws_health, "floci-az-azenv": az_health}),
+    )
+
+    assert env_status("azenv").status == expected
+
+
+def test_env_status_for_a_non_azure_env_reports_only_the_aws_health(tmp_path, monkeypatch):
+    # An AWS-only env (no `az` in ports) must never inspect a floci-az
+    # container - it has none - and its status is exactly the AWS
+    # container's own health, unchanged from the slice-1 behavior. The fake
+    # asserts the az container is never inspected.
+    aws_only = _env("awsonly", datetime(2026, 1, 1, tzinfo=UTC))
+    assert "az" not in aws_only.ports
+    monkeypatch.setattr(state, "ENVS_DIR", tmp_path / "envs")
+    state.save_state(aws_only)
+    monkeypatch.setattr(
+        "foundry.engine.run_docker", _fake_inspect_docker({"floci-awsonly": "healthy"})
+    )
+
+    assert env_status("awsonly").status == "healthy"
+
+
+# --- create_env: the fixed az port is a one-Azure-env-at-a-time constraint --
+
+
+def test_create_env_with_azure_refuses_when_another_azure_env_already_exists(tmp_path, monkeypatch):
+    # The floci-az host port is FIXED (default 14577), not dynamically
+    # allocated, because Prizmanyx's worker reads one hard-coded
+    # PRIZMANYX_AZURE_ARM_ENDPOINT. Two envs therefore cannot both bind it -
+    # a second Azure-enabled create must refuse with a clear message, and it
+    # must refuse BEFORE starting (or even touching docker for) any
+    # container, so no half-built environment is left behind.
+    monkeypatch.setattr(state, "ENVS_DIR", tmp_path / "envs")
+    existing = _env("first", datetime(2026, 1, 1, tzinfo=UTC)).model_copy(
+        update={"ports": {"aws": 15600, "az": 14577}}
+    )
+    state.save_state(existing)
+
+    calls: list[list[str]] = []
+
+    def _recording_docker(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("foundry.engine.run_docker", _recording_docker)
+
+    with pytest.raises(EngineError, match="one Azure-enabled env at a time"):
+        create_env("second", EnvSpec(name_prefix="demo"), with_azure=True)
+
+    assert calls == [], "must refuse before starting any container"
+    assert not state.state_file("second").exists()
+
+
+class _ReachedDockerRunError(Exception):
+    """Sentinel: `create_env` got as far as issuing a `docker run`."""
+
+
+def test_create_env_without_azure_is_allowed_beside_an_existing_azure_env(tmp_path, monkeypatch):
+    # The one-Azure-env constraint only bites Azure-enabled creates. An
+    # AWS-only env (`with_azure=False`) may stand beside an existing Azure
+    # env - it never touches the fixed az port. Proven by reaching the AWS
+    # `docker run` (the refusal guard would have raised before this).
+    monkeypatch.setattr(state, "ENVS_DIR", tmp_path / "envs")
+    existing = _env("first", datetime(2026, 1, 1, tzinfo=UTC)).model_copy(
+        update={"ports": {"aws": 15600, "az": 14577}}
+    )
+    state.save_state(existing)
+
+    def _boom_on_run(args: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        if args[:1] == ["run"]:
+            raise _ReachedDockerRunError
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("foundry.engine.run_docker", _boom_on_run)
+
+    with pytest.raises(_ReachedDockerRunError):
+        create_env("second", EnvSpec(name_prefix="demo"), with_azure=False)
+
+
 # --- docker integration -------------------------------------------------
 
 ENV_NAME = "t3-engine-test"
@@ -542,11 +689,15 @@ def test_create_status_remove_round_trip_leaves_no_containers_behind():
     # isolated tmp_path would silently hide. Full cleanup in `finally`
     # instead - both the container AND the state directory, so a failed
     # run can never wedge a later run under the same name.
+    #
+    # AWS-only (`with_azure=False`): this test pins the single-container
+    # lifecycle. The two-container path has its own acceptance test below.
     spec = EnvSpec(name_prefix="t3-engine-test")
     try:
-        created = create_env(ENV_NAME, spec)
+        created = create_env(ENV_NAME, spec, with_azure=False)
         assert created.name == ENV_NAME
         assert PORT_RANGE_START <= created.ports["aws"] < PORT_RANGE_END
+        assert "az" not in created.ports
 
         status = env_status(ENV_NAME)
         assert status.status == "healthy"
@@ -566,3 +717,49 @@ def test_create_status_remove_round_trip_leaves_no_containers_behind():
         state.delete_env_dir(ENV_NAME)
 
     assert _docker_ps_names(container_name(ENV_NAME)) == []
+
+
+ENV_NAME_AZ = "t4-az-test"
+
+
+@pytest.mark.docker
+def test_create_with_azure_brings_up_both_planes_serves_arm_and_removes_cleanly():
+    # The slice-4 acceptance: an Azure-enabled create stands up BOTH the
+    # AWS control plane (dynamic port) and the floci-az ARM plane (the fixed
+    # az port), both report healthy, the ARM plane actually answers
+    # `GET /metadata/endpoints` with a 200, and `remove_env` tears both down
+    # leaving no residue under either name. The floci-az container is
+    # started WITHOUT the docker-socket mount (its vm service is mocked; only
+    # its functions service needs a socket, which no slice-4 resource type
+    # exercises) - so this test also confirms it goes healthy without it.
+    import httpx
+
+    spec = EnvSpec(name_prefix="t4-az-test")
+    try:
+        created = create_env(ENV_NAME_AZ, spec, with_azure=True)
+        assert PORT_RANGE_START <= created.ports["aws"] < PORT_RANGE_END
+        assert created.ports["az"] == floci_az_port()
+
+        status = env_status(ENV_NAME_AZ)
+        assert status.status == "healthy", "both containers must be healthy"
+
+        response = httpx.get(
+            f"http://localhost:{created.ports['az']}/metadata/endpoints", timeout=10.0
+        )
+        assert response.status_code == 200
+
+        report = remove_env(ENV_NAME_AZ)
+        assert report.reaped == []  # no terraform apply - nothing to have spawned
+    finally:
+        # Raw cleanup of BOTH containers plus the state dir, whatever failed
+        # above - two exact container names, never the prizmanyx-* stack.
+        subprocess.run(
+            ["docker", "rm", "-f", container_name(ENV_NAME_AZ)], capture_output=True, check=False
+        )
+        subprocess.run(
+            ["docker", "rm", "-f", az_container_name(ENV_NAME_AZ)], capture_output=True, check=False
+        )
+        state.delete_env_dir(ENV_NAME_AZ)
+
+    assert _docker_ps_names(container_name(ENV_NAME_AZ)) == []
+    assert _docker_ps_names(az_container_name(ENV_NAME_AZ)) == []

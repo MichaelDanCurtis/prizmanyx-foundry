@@ -39,6 +39,24 @@ DEFAULT_FLOCI_IMAGE = (
 )
 FLOCI_IMAGE_ENV_VAR = "FOUNDRY_FLOCI_IMAGE"
 
+# The floci-az (Azure ARM control plane) image, likewise digest-pinned and
+# overridable only through its own named escape hatch. Its host port is
+# FIXED, not allocated (see DEFAULT_FLOCI_AZ_PORT), because Prizmanyx's
+# worker reads one hard-coded PRIZMANYX_AZURE_ARM_ENDPOINT - so only one
+# Azure-enabled environment can exist at a time (create_env enforces this).
+DEFAULT_FLOCI_AZ_IMAGE = (
+    "floci/floci-az@sha256:6566c73b8f4b6e3ef90322c8c84a47258bb1ca13c82ea1d40027f7af11247e30"
+)
+FLOCI_AZ_IMAGE_ENV_VAR = "FOUNDRY_FLOCI_AZ_IMAGE"
+
+# floci-az listens on 4577 inside the container; the host port is the STABLE
+# well-known DEFAULT_FLOCI_AZ_PORT (overridable via FOUNDRY_FLOCI_AZ_PORT),
+# deliberately NOT drawn from the dynamic [15600, 16000) AWS range - a fixed,
+# predictable endpoint is exactly what the single-Azure-env constraint buys.
+FLOCI_AZ_INTERNAL_PORT = 4577
+DEFAULT_FLOCI_AZ_PORT = 14577
+FLOCI_AZ_PORT_ENV_VAR = "FOUNDRY_FLOCI_AZ_PORT"
+
 PORT_RANGE_START = 15600
 PORT_RANGE_END = 16000  # exclusive; the allocatable range is [15600, 15999]
 
@@ -104,9 +122,33 @@ def floci_image() -> str:
     return os.environ.get(FLOCI_IMAGE_ENV_VAR, DEFAULT_FLOCI_IMAGE)
 
 
+def floci_az_image() -> str:
+    """The floci-az image reference to run: the digest pin, unless the
+    operator has deliberately overridden it via FOUNDRY_FLOCI_AZ_IMAGE."""
+    return os.environ.get(FLOCI_AZ_IMAGE_ENV_VAR, DEFAULT_FLOCI_AZ_IMAGE)
+
+
+def floci_az_port() -> int:
+    """The FIXED host port floci-az binds - DEFAULT_FLOCI_AZ_PORT unless the
+    operator overrode it via FOUNDRY_FLOCI_AZ_PORT. Not allocated per-env:
+    it is the single, predictable ARM endpoint the Prizmanyx worker reads,
+    which is why only one Azure-enabled environment can exist at a time."""
+    raw = os.environ.get(FLOCI_AZ_PORT_ENV_VAR)
+    return int(raw) if raw is not None else DEFAULT_FLOCI_AZ_PORT
+
+
 def container_name(name: str) -> str:
-    """The docker container name for environment `name`."""
+    """The docker container name for environment `name`'s AWS control plane."""
     return f"floci-{name}"
+
+
+def az_container_name(name: str) -> str:
+    """The docker container name for environment `name`'s Azure (floci-az)
+    control plane. Shares the `floci-` prefix - so it appears in the
+    `docker ps --filter name=floci-` reap sweep - but is NOT one of
+    CHILD_NAME_PREFIXES; `select_children_to_reap` protects a live peer's az
+    parent via `other_parent_names`, exactly like its AWS parent."""
+    return f"floci-az-{name}"
 
 
 def allocate_port(start: int = PORT_RANGE_START, end: int = PORT_RANGE_END) -> int:
@@ -167,19 +209,66 @@ def _wait_healthy(container: str, timeout: float = HEALTHY_TIMEOUT_SECONDS) -> N
     )
 
 
-def create_env(name: str, spec: EnvSpec, *, seed: int | None = None) -> EnvState:
+def _merge_health(aws_status: str, az_status: str) -> str:
+    """Collapse the AWS and Azure container healths into one status string.
+
+    Both healthy -> a plain "healthy". Otherwise the result NAMES the plane(s)
+    at fault (`"aws:<status>"`, `"az:<status>"`, or both space-joined) rather
+    than a bare "unhealthy" that would hide which of the two containers broke -
+    `foundry ls` needs to point at the specific container to look at.
+    """
+    if aws_status == "healthy" and az_status == "healthy":
+        return "healthy"
+    faults: list[str] = []
+    if aws_status != "healthy":
+        faults.append(f"aws:{aws_status}")
+    if az_status != "healthy":
+        faults.append(f"az:{az_status}")
+    return " ".join(faults)
+
+
+def _ensure_single_azure_env() -> None:
+    """Refuse if any tracked environment already holds the fixed az port.
+
+    The floci-az host port is fixed (see `floci_az_port`), so two containers
+    cannot both bind it - only one Azure-enabled environment can exist at a
+    time. Checked BEFORE anything is allocated or started, so a refusal
+    leaves nothing half-built behind.
+    """
+    for env in state.list_envs():
+        if "az" in env.ports:
+            raise EnvStartError(
+                f"az port {floci_az_port()} in use - one Azure-enabled env at a time "
+                f"(environment {env.name!r} already holds it; remove it first, "
+                "or create this one with azure disabled)"
+            )
+
+
+def create_env(
+    name: str, spec: EnvSpec, *, seed: int | None = None, with_azure: bool = True
+) -> EnvState:
     """Bring up a new Floci-backed environment and record it.
 
     Order matters for cleanliness on failure: validate the name (cheapest,
     fails before touching anything - this also rejects a name that would
     collide with CHILD_NAME_PREFIXES; see `state.validate_env_name`), check
-    no environment of this name is already tracked, allocate a port, start
-    the container, wait for it to report healthy, and only once all of
-    that has succeeded, write the spec copy and state.json. A failure at
-    any docker step removes the container it just started before raising -
-    nothing left running, and nothing for `list_envs`/`remove_env` to find,
-    so a retry under the same name starts clean rather than tripping over a
-    failed attempt's leftovers.
+    no environment of this name is already tracked, refuse if `with_azure`
+    and another Azure env already holds the fixed az port, allocate a port,
+    start the AWS container, wait for it to report healthy, then (when
+    `with_azure`) start the floci-az container and wait for IT to report
+    healthy, and only once all of that has succeeded, write the spec copy
+    and state.json. A failure at any docker step removes every container
+    this call started before raising - crucially, if the AZ container fails
+    to start or go healthy, the already-started AWS container is torn down
+    too, so a failed two-container create never leaves a half-environment
+    running for `list_envs`/`remove_env` to trip over on retry.
+
+    `with_azure` defaults to True so the discovery -> deploy -> verify loop
+    works out of the box; pass False for an AWS-only estate that neither
+    needs the Azure ARM plane nor should contend for its fixed host port.
+    Because that port is fixed (`floci_az_port`), only ONE Azure-enabled
+    environment can exist at a time - a second `with_azure=True` create
+    refuses up front (see `_ensure_single_azure_env`).
 
     `seed` is recorded on EnvState verbatim when the caller generated
     `spec` via `random_spec` and wants that traceable; hand-written or
@@ -193,6 +282,11 @@ def create_env(name: str, spec: EnvSpec, *, seed: int | None = None) -> EnvState
     state.validate_env_name(name)
     if state.state_file(name).is_file():
         raise EnvAlreadyExistsError(f"environment {name!r} already exists")
+
+    if with_azure:
+        # Refuse a second Azure env BEFORE allocating or starting anything -
+        # the fixed az port can back only one at a time.
+        _ensure_single_azure_env()
 
     port = allocate_port()
     container = container_name(name)
@@ -232,6 +326,10 @@ def create_env(name: str, spec: EnvSpec, *, seed: int | None = None) -> EnvState
         run_docker(["rm", "-f", container])
         raise
 
+    ports = {"aws": port}
+    if with_azure:
+        ports["az"] = _start_az_container(name, aws_container=container)
+
     directory = state.ensure_env_dir(name)
     spec_path = directory / "spec.yaml"
     spec_path.write_text(yaml.safe_dump(spec.model_dump()))
@@ -239,13 +337,60 @@ def create_env(name: str, spec: EnvSpec, *, seed: int | None = None) -> EnvState
     env_state = EnvState(
         name=name,
         created_at=datetime.now(UTC),
-        ports={"aws": port},
+        ports=ports,
         spec_path=spec_path,
         seed=seed,
         status="running",
     )
     state.save_state(env_state)
     return env_state
+
+
+def _start_az_container(name: str, *, aws_container: str) -> int:
+    """Start environment `name`'s floci-az container and wait for it healthy.
+
+    Returns the fixed host port it bound. On ANY failure (docker run
+    non-zero, or never reporting healthy) this tears down BOTH the az
+    container it was starting AND `aws_container` - the AWS container this
+    create already brought up - before re-raising, so a two-container create
+    that fails halfway never leaves the AWS half running orphaned.
+
+    No docker-socket mount: floci-az's vm service is mocked (no docker), and
+    only its functions service touches a socket, which no slice-4 resource
+    type exercises. Confirmed healthy without the mount in Task 1's live
+    probe; revisit if a later resource type needs a floci-az child container.
+    """
+    az_port = floci_az_port()
+    az_container = az_container_name(name)
+    # Clear any stale az container left by a prior failed attempt, same as
+    # the AWS path - retrying must not trip over docker's "name already in use".
+    run_docker(["rm", "-f", az_container])
+
+    az_result = run_docker(
+        [
+            "run",
+            "-d",
+            "--name",
+            az_container,
+            "-p",
+            f"{az_port}:{FLOCI_AZ_INTERNAL_PORT}",
+            floci_az_image(),
+        ],
+        timeout=DOCKER_RUN_TIMEOUT_SECONDS,
+    )
+    if az_result.returncode != 0:
+        run_docker(["rm", "-f", az_container])  # best-effort: clear any partial object.
+        run_docker(["rm", "-f", aws_container])  # two-container cleanup: don't strand the AWS half.
+        raise EnvStartError(f"docker run failed for {az_container!r}: {az_result.stderr.strip()}")
+
+    try:
+        _wait_healthy(az_container)
+    except (EnvStartError, subprocess.TimeoutExpired):
+        run_docker(["rm", "-f", az_container])
+        run_docker(["rm", "-f", aws_container])  # two-container cleanup.
+        raise
+
+    return az_port
 
 
 def env_status(name: str) -> EnvState:
@@ -255,12 +400,24 @@ def env_status(name: str) -> EnvState:
     record `create_env` wrote; `status` alone reflects docker's live answer
     - "healthy" / "unhealthy" / "starting" / "not_found" - not
     last-persisted knowledge. Read-only: does not rewrite state.json.
+
+    For an Azure-enabled environment (one carrying `ports["az"]`) the status
+    MERGES both containers' healths (`_merge_health`): both healthy collapses
+    to "healthy", otherwise the result names the unhealthy plane(s). An
+    AWS-only environment inspects only its one container, exactly as before -
+    it has no floci-az container to ask about.
     """
     try:
         persisted = state.load_state(name)
     except FileNotFoundError as exc:
         raise EnvNotFoundError(f"no tracked environment named {name!r}") from exc
-    return persisted.model_copy(update={"status": _container_health(container_name(name))})
+
+    aws_status = _container_health(container_name(name))
+    if "az" not in persisted.ports:
+        merged = aws_status
+    else:
+        merged = _merge_health(aws_status, _container_health(az_container_name(name)))
+    return persisted.model_copy(update={"status": merged})
 
 
 def list_envs() -> list[EnvState]:
@@ -334,21 +491,26 @@ def select_children_to_reap(
     target: EnvState,
     other_live_envs: Iterable[EnvState],
 ) -> ReapSelection:
-    """Classify every floci-child-prefixed row in `candidates` as `target`'s
-    to reap, or one to spare. Rows that don't match a child prefix at all
-    (the untouchable compose stack, unrelated containers) are ignored
-    entirely - neither reaped nor reported as spared.
+    """Classify each row in `candidates` as `target`'s to reap, or one to
+    spare. Rows that are neither a live peer's parent container (rule 1) nor
+    a child-prefix match (the untouchable compose stack, unrelated
+    containers, `target`'s own parents) are ignored entirely - neither
+    reaped nor reported as spared.
 
-    A prefix-matching row is REAPED only if ALL of:
+    A row is REAPED only if ALL of:
 
     1. Its name is not literally another tracked environment's own parent
-       container (`floci-<other.name>` for some `other` in
-       `other_live_envs`) - checked first, unconditionally, regardless of
-       any timestamp. An environment whose NAME happens to start with a
-       child stem (e.g. an env named `rds-x`, container `floci-rds-x`)
+       container - EITHER its AWS parent (`floci-<other.name>`) OR its Azure
+       parent (`floci-az-<other.name>`) for some `other` in
+       `other_live_envs`. Checked FIRST, before the child-prefix gate,
+       unconditionally, regardless of any timestamp - because the Azure
+       parent `floci-az-<name>` is NOT a CHILD_NAME_PREFIXES match, so a
+       gate-first order would drop it as "ignored" and this protection
+       would never fire (case C). An environment whose NAME happens to start
+       with a child stem (e.g. an env named `rds-x`, container `floci-rds-x`)
        collides with CHILD_NAME_PREFIXES by construction of the
-       `floci-<name>` join. `state.validate_env_name` now refuses to
-       create such a name, but this check is the second, clock-independent
+       `floci-<name>` join (case B). `state.validate_env_name` now refuses
+       to create such a name, but this check is the second, clock-independent
        line of defense: it protects a live peer's own parent container
        even if one exists anyway (a legacy environment from before this
        validation existed, for instance) - and it is NOT redundant with
@@ -384,15 +546,23 @@ def select_children_to_reap(
     on them.
     """
     other_live = [env for env in other_live_envs if env.name != target.name]
-    other_parent_names = {container_name(env.name) for env in other_live}
+    # A live peer is protected by BOTH its parent container names: its AWS
+    # parent `floci-<name>` (rule 1, case B) AND its Azure parent
+    # `floci-az-<name>` (case C). The az name is not a CHILD_NAME_PREFIXES
+    # match, so this membership check is done BEFORE the `_is_floci_child`
+    # gate - otherwise `floci-az-<peer>` would be silently ignored rather
+    # than reported as spared, and the guard would read as dead code.
+    other_parent_names = {container_name(env.name) for env in other_live} | {
+        az_container_name(env.name) for env in other_live
+    }
 
     reap: list[ContainerRow] = []
     spare: list[ContainerRow] = []
     for row in candidates:
-        if not _is_floci_child(row.name):
-            continue
         if row.name in other_parent_names:
             spare.append(row)
+            continue
+        if not _is_floci_child(row.name):
             continue
         if row.created_at <= target.created_at:
             spare.append(row)
@@ -471,10 +641,12 @@ def remove_env(name: str) -> RemovalReport:
     child container this engine can safely attribute to it, and its
     on-disk state - and report exactly what happened.
 
-    Order: remove the parent first (fast, always safe, best-effort - an
-    already-gone parent is not fatal), THEN reap children (recorded or
-    swept, see below - the spike found children only matter once the
-    parent's gone), THEN delete the state directory last. That ordering
+    Order: remove BOTH parent containers first - the AWS parent
+    (`floci-<name>`) and the Azure parent (`floci-az-<name>`, a no-op for an
+    AWS-only env) - fast, always safe, best-effort (an already-gone parent
+    is not fatal), THEN reap children (recorded or swept, see below - the
+    spike found children only matter once the parent's gone), THEN delete
+    the state directory last. That ordering
     means a failure partway through leaves `list_envs`/`env_status` still
     able to see this environment and a retry able to pick up whatever this
     call did not finish, rather than an environment that vanished from
@@ -520,6 +692,12 @@ def remove_env(name: str) -> RemovalReport:
         raise EnvNotFoundError(f"no tracked environment named {name!r}") from exc
 
     run_docker(["rm", "-f", container_name(name)])  # best-effort: already-gone is fine.
+    # This env's OWN floci-az container, removed by name BEFORE the child
+    # reap runs - so the target's Azure parent is torn down deterministically
+    # (never left to the created_at heuristic, which does not even treat
+    # `floci-az-<name>` as a candidate) and is gone from the `docker ps`
+    # sweep the fallback path then takes. A no-op for an AWS-only env.
+    run_docker(["rm", "-f", az_container_name(name)])  # best-effort: already-gone is fine.
 
     if target.children is not None:
         reaped: list[str] = []
