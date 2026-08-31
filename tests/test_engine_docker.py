@@ -294,13 +294,26 @@ def test_select_children_to_reap_auto_reaps_nothing_once_two_environments_are_al
 class _FakeDocker:
     """Records every `run_docker` call `remove_env` makes and answers a
     `ps -a --filter name=floci-` call with a canned table; every other call
-    (`rm -f`, ...) succeeds trivially. Lets `remove_env`'s REAL dispatch
-    logic run end-to-end - not a reimplementation of it - against
-    controlled `docker ps` output with no real docker daemon involved.
+    (`rm -f`, ...) succeeds trivially UNLESS its target name is listed in
+    `already_gone_names`, in which case it mimics the REAL, empirically
+    verified shape of `docker rm -f <missing container>` on this docker
+    version (29.6.2): returncode 0 (NOT non-zero - verified directly,
+    contrary to an earlier assumption), stdout empty, stderr containing
+    "Error response from daemon: No such container: <name>". A `rm -f` of
+    a container that DOES exist instead echoes the name to stdout with an
+    empty stderr - also verified directly. `remove_env`'s own honesty
+    check (see `test_remove_env_reports_a_manually_removed_recorded_child_
+    as_already_gone_not_reaped`) must key off stderr content, never
+    returncode, or it cannot tell the two apart against a real daemon.
+
+    Lets `remove_env`'s REAL dispatch logic run end-to-end - not a
+    reimplementation of it - against controlled `docker ps`/`docker rm`
+    output with no real docker daemon involved.
     """
 
-    def __init__(self, ps_stdout: str = ""):
+    def __init__(self, ps_stdout: str = "", already_gone_names: frozenset[str] = frozenset()):
         self.ps_stdout = ps_stdout
+        self.already_gone_names = already_gone_names
         self.calls: list[list[str]] = []
 
     def __call__(self, args: list[str]) -> subprocess.CompletedProcess[str]:
@@ -311,6 +324,11 @@ class _FakeDocker:
         self.calls.append(args)
         if args[:2] == ["ps", "-a"]:
             return subprocess.CompletedProcess(args, 0, stdout=self.ps_stdout, stderr="")
+        if args[:2] == ["rm", "-f"] and args[2] in self.already_gone_names:
+            stderr = f"Error response from daemon: No such container: {args[2]}\n"
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr=stderr)
+        if args[:2] == ["rm", "-f"]:
+            return subprocess.CompletedProcess(args, 0, stdout=f"{args[2]}\n", stderr="")
         return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
 
@@ -332,10 +350,74 @@ def test_remove_env_reaps_exactly_the_recorded_children_when_present(tmp_path, m
     assert sorted(report.reaped) == ["floci-ec2-i-abc", "floci-rds-db-xyz"]
     assert report.spared == []
     assert report.unparsed == []
+    assert report.already_gone == []
     # The primary path never needs a `docker ps` sweep at all - it already
     # knows exactly what to remove, so it must never even ask.
     assert not any(call[:2] == ["ps", "-a"] for call in fake_docker.calls)
     assert not state.state_file("target").exists()
+
+
+def test_remove_env_reports_a_manually_removed_recorded_child_as_already_gone_not_reaped(
+    tmp_path, monkeypatch
+):
+    # Findings 1 + 2a: RemovalReport.reaped must be EXACT, not an echo of
+    # target.children. A recorded child that a prior destroy() (or a
+    # human) already removed must land in `already_gone`, never silently
+    # counted as `reaped` - "visible truth, not silence". The fake here
+    # mimics the REAL, empirically verified `docker rm -f` shape for a
+    # missing container: returncode 0, "No such container" on stderr -
+    # NOT a non-zero exit, which this docker version never produces for
+    # `-f`. A fix keyed on returncode alone would misclassify this case
+    # against a real daemon even though it could still pass against a
+    # naively-built fake - this test's fake is built from a real
+    # `docker rm -f`/`docker rm -f <missing>` run, not from assumption.
+    target = _env("target", datetime(2026, 1, 1, tzinfo=UTC)).model_copy(
+        update={"children": ["floci-ec2-i-abc", "floci-rds-db-xyz"]}
+    )
+    _save_env_in_isolated_dir(tmp_path, monkeypatch, target)
+    fake_docker = _FakeDocker(already_gone_names=frozenset({"floci-rds-db-xyz"}))
+    monkeypatch.setattr("foundry.engine.run_docker", fake_docker)
+
+    report = remove_env("target")
+
+    assert report.reaped == ["floci-ec2-i-abc"]
+    assert report.already_gone == ["floci-rds-db-xyz"]
+    assert report.spared == []
+    assert report.unparsed == []
+
+
+def test_remove_env_primary_path_reaps_recorded_children_even_with_an_older_live_peer(
+    tmp_path, monkeypatch
+):
+    # Finding 2b: the Task-3 heuristic (select_children_to_reap, FALLBACK
+    # only) spares a row whenever ANY other live environment predates it -
+    # see test_select_children_to_reap_spares_an_older_live_envs_child_case_a2
+    # and the "auto_reaps_nothing_once_two_environments_are_alive" test
+    # above. The PRIMARY path must never even be exposed to that rule: a
+    # recorded child is reaped unconditionally, by construction (an early
+    # return before `other_live`/`select_children_to_reap` is ever
+    # touched), regardless of any peer's age. Pinned here as a real test,
+    # not just an inference from reading the code.
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    older_peer = _env("older-peer", t0)
+    target = _env("target", t0 + timedelta(minutes=5)).model_copy(
+        update={"children": ["floci-ec2-i-abc"]}
+    )
+    monkeypatch.setattr(state, "ENVS_DIR", tmp_path / "envs")
+    state.save_state(older_peer)
+    state.save_state(target)
+    fake_docker = _FakeDocker()
+    monkeypatch.setattr("foundry.engine.run_docker", fake_docker)
+
+    report = remove_env("target")
+
+    assert report.reaped == ["floci-ec2-i-abc"]
+    assert report.spared == []
+    assert report.already_gone == []
+    # By-construction proof: the primary path never even calls `docker ps`
+    # to look for peers - a regression that routed it through the
+    # heuristic anyway would show up here as an extra `ps -a` call.
+    assert not any(call[:2] == ["ps", "-a"] for call in fake_docker.calls)
 
 
 def test_remove_env_reaps_nothing_when_a_recorded_apply_spawned_zero_children(
@@ -351,7 +433,7 @@ def test_remove_env_reaps_nothing_when_a_recorded_apply_spawned_zero_children(
 
     report = remove_env("target")
 
-    assert report == RemovalReport(reaped=[], spared=[], unparsed=[])
+    assert report == RemovalReport(reaped=[], spared=[], unparsed=[], already_gone=[])
     assert not any(call[:2] == ["ps", "-a"] for call in fake_docker.calls)
 
 
@@ -371,6 +453,7 @@ def test_remove_env_falls_back_to_the_heuristic_when_children_was_never_recorded
     assert report.reaped == ["floci-ec2-i-orphan"]
     assert report.spared == []
     assert report.unparsed == []
+    assert report.already_gone == []  # already_gone is a PRIMARY-path-only concept
     # The fallback path DOES need the docker ps sweep - that's the point.
     assert any(call[:2] == ["ps", "-a"] for call in fake_docker.calls)
 

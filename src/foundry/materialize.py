@@ -42,16 +42,37 @@ _DEFAULT_DB_PASSWORD = "foundry-test-password"  # floci's fake RDS, not a real c
 def _hcl_string(value: str) -> str:
     """A double-quoted HCL string literal for `value`, safely escaped.
 
-    HCL's string-escaping rules for backslash, double-quote, and control
-    characters are a superset-compatible match for JSON's, so `json.dumps`
-    gives correct escaping without a hand-rolled escaper - the
-    emitter-side defense for every free-form spec field (name_hint,
-    instance_type, cidr, az_suffix) EnvSpec does not itself
+    Two independent passes, because they close two different gaps:
+
+    1. `json.dumps` for backslash/double-quote/control-character escaping.
+       JSON's string-escaping rules are a compatible match for HCL's own
+       for exactly these characters, so this pass alone stops a hostile
+       value from closing the string literal early and injecting new HCL
+       syntax after it (an earlier version of this docstring called this
+       a "superset" match and stopped there - true as far as it went, but
+       incomplete: see pass 2).
+    2. Neutralizing HCL's OWN template syntax within the string's
+       content - `${...}` (interpolation) and `%{...}` (a directive, e.g.
+       `%{if ...}...%{endif}`) are special to HCL even INSIDE a properly
+       quoted, properly escaped string literal. `json.dumps` has no idea
+       these exist, since they are not JSON syntax at all - a value
+       containing a literal `${aws_iam_role.x.arn}` would have terraform
+       evaluate that expression for real once applied, a live
+       cross-resource reference, not inert text, which is a materially
+       different (and worse) injection than an early string close. Each
+       occurrence is escaped to HCL's own documented literal form -
+       `$${` for a literal dollar-brace, `%%{` for a literal
+       percent-brace - exactly as an operator writing raw HCL by hand
+       would to keep a stray `$` or `%` next to a brace inert.
+
+    This is the emitter-side defense for every free-form spec field
+    (name_hint, instance_type, cidr, az_suffix) EnvSpec does not itself
     boundary-validate. Never used to build a resource LABEL - see this
     module's own docstring for why labels stay clear of this content
     entirely instead of merely escaping it.
     """
-    return json.dumps(value)
+    escaped = json.dumps(value)
+    return escaped.replace("${", "$${").replace("%{", "%%{")
 
 
 def _slug(text: str) -> str:

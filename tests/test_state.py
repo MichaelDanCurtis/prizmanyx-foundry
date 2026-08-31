@@ -6,6 +6,7 @@ until that file lands (the TDD red step for this task).
 
 from __future__ import annotations
 
+import json
 import re
 import stat
 from datetime import UTC, datetime
@@ -65,6 +66,33 @@ def test_save_state_creates_a_0700_directory():
 def test_load_state_raises_file_not_found_for_an_untracked_env():
     with pytest.raises(FileNotFoundError):
         load_state("never-created")
+
+
+def test_load_state_defaults_children_to_none_for_pre_migration_json_without_the_key():
+    # Finding 4: a state.json written before EnvState gained `children`
+    # (the Task 3 era) has no such key in it at all - `load_state` must
+    # still parse it, with `children` defaulting to None. That None is
+    # exactly `engine.remove_env`'s signal to use the created_at heuristic
+    # FALLBACK rather than the recorded-children PRIMARY path for these
+    # pre-existing environments - so this is a load-bearing default, not
+    # incidental pydantic convenience.
+    directory = state.ensure_env_dir("legacy")
+    pre_migration_json = json.dumps(
+        {
+            "name": "legacy",
+            "created_at": "2026-01-01T00:00:00+00:00",
+            "ports": {"aws": 15600},
+            "spec_path": "/tmp/legacy/spec.yaml",
+            "seed": None,
+            "status": "running",
+            # deliberately no "children" key at all
+        }
+    )
+    (directory / "state.json").write_text(pre_migration_json)
+
+    loaded = load_state("legacy")
+
+    assert loaded.children is None
 
 
 def test_list_envs_is_empty_when_the_envs_directory_does_not_exist_yet():

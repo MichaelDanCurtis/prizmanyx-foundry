@@ -1,8 +1,11 @@
-"""Docker-marked acceptance tests for foundry.tf_runner: real `terraform`
+"""Tests for foundry.tf_runner: a pure section (fake docker, no daemon, no
+terraform binary) proving `apply()`'s own children-bookkeeping, plus the
+`@pytest.mark.docker` acceptance tests that run real `terraform`
 apply/destroy against a real floci environment, verified host-side via
 boto3.
 
-Two scenarios, because they are mutually exclusive within one environment's
+Two docker-marked scenarios, because they are mutually exclusive within
+one environment's
 lifecycle (empirically confirmed while building this module: a clean
 `terraform destroy` makes floci tear down its own real-engine child
 containers itself, the same way deleting a real RDS instance or
@@ -33,9 +36,11 @@ failed run never wedges a later one.
 from __future__ import annotations
 
 import subprocess
+from datetime import UTC, datetime
 
 import boto3
 import pytest
+import yaml
 
 from foundry import state
 from foundry.engine import container_name, create_env, remove_env
@@ -47,7 +52,99 @@ from foundry.envspec import (
     SubnetSpec,
     VpcSpec,
 )
+from foundry.state import EnvState
 from foundry.tf_runner import apply, destroy
+
+# --- pure: apply()'s own children bookkeeping (fake docker, no daemon) ------
+
+
+class _FakeTerraformDocker:
+    """Answers `ps --filter name=floci-` (no `-a` - matches
+    `tf_runner._running_floci_container_names`) from a queue of canned
+    snapshots consumed one per call, and every `docker run ... terraform`
+    invocation with a canned successful transcript - enough to drive
+    `apply()`'s own before/after-delta bookkeeping with no real docker or
+    terraform process involved at all.
+    """
+
+    def __init__(self, ps_snapshots: list[set[str]], resources_added: int = 1):
+        self._ps_snapshots = list(ps_snapshots)
+        self._resources_added = resources_added
+        self.calls: list[list[str]] = []
+
+    def __call__(
+        self,
+        args: list[str],
+        *,
+        timeout: float | None = None,  # noqa: ARG002 - accepted because _run_terraform passes it
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(args)
+        if args[0] == "ps":
+            names = self._ps_snapshots.pop(0)
+            stdout = "".join(f"{name}\n" for name in sorted(names))
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+        if args[0] == "run":
+            if "apply" in args:
+                stdout = (
+                    f"Apply complete! Resources: {self._resources_added} added, "
+                    "0 changed, 0 destroyed.\n"
+                )
+            elif "destroy" in args:
+                stdout = "Destroy complete! Resources: 1 destroyed.\n"
+            else:
+                stdout = "Terraform has been successfully initialized!\n"
+            return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+
+def _seed_env_with_a_real_spec_file(tmp_path, monkeypatch, name: str = "demo") -> EnvState:
+    # apply() calls envspec.load_spec(env.spec_path) for real (pure file
+    # I/O, no docker needed) - so this needs an actual spec.yaml on disk,
+    # not just an in-memory EnvSpec.
+    monkeypatch.setattr(state, "ENVS_DIR", tmp_path / "envs")
+    directory = state.ensure_env_dir(name)
+    spec_path = directory / "spec.yaml"
+    spec_path.write_text(yaml.safe_dump(EnvSpec(name_prefix="demo-prefix").model_dump()))
+    env = EnvState(
+        name=name,
+        created_at=datetime(2026, 1, 1, tzinfo=UTC),
+        ports={"aws": 15650},
+        spec_path=spec_path,
+        status="running",
+    )
+    state.save_state(env)
+    return env
+
+
+def test_apply_unions_new_children_across_repeated_applies_rather_than_replacing(
+    tmp_path, monkeypatch
+):
+    # Finding 3: a second apply() on the same environment must not lose
+    # track of the first apply's own children - apply()'s own docstring
+    # promises a union, not an overwrite. Driven entirely through a fake
+    # `run_docker` and canned `docker ps` snapshots, so this pins the
+    # bookkeeping logic itself, independent of whether any particular real
+    # terraform apply happens to spawn anything.
+    env = _seed_env_with_a_real_spec_file(tmp_path, monkeypatch)
+    fake_docker = _FakeTerraformDocker(
+        ps_snapshots=[
+            {"floci-demo"},  # before 1st apply: just the parent
+            {"floci-demo", "floci-ec2-i-a"},  # after 1st apply: ec2 child spawned
+            {"floci-demo", "floci-ec2-i-a"},  # before 2nd apply: unchanged
+            {"floci-demo", "floci-ec2-i-a", "floci-ec2-i-b"},  # after 2nd: another spawned
+        ]
+    )
+    monkeypatch.setattr("foundry.tf_runner.run_docker", fake_docker)
+
+    first_result = apply(env)
+    assert first_result.ok
+    env_after_first = state.load_state(env.name)
+    assert env_after_first.children == ["floci-ec2-i-a"]
+
+    second_result = apply(env_after_first)
+    assert second_result.ok
+    env_after_second = state.load_state(env.name)
+    assert env_after_second.children == ["floci-ec2-i-a", "floci-ec2-i-b"]
 
 
 def _aws_client(service: str, port: int):

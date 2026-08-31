@@ -23,7 +23,7 @@ import socket
 import subprocess
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 import yaml
@@ -51,6 +51,14 @@ HEALTH_POLL_INTERVAL_SECONDS = 1.0
 # cold machine, which a 30s timeout would fail spuriously.
 DOCKER_QUICK_TIMEOUT_SECONDS = 30.0
 DOCKER_RUN_TIMEOUT_SECONDS = 300.0
+
+# `docker rm -f <missing container>` exits 0 (NOT an error) while writing
+# this to stderr - verified directly against a real daemon (docker
+# 29.6.2), which is what `remove_env`'s primary reap path keys off of to
+# tell "genuinely removed" apart from "was already gone" (see its own
+# docstring). Checking `returncode` alone cannot distinguish the two for
+# `-f`: it is 0 either way.
+_NO_SUCH_CONTAINER_MARKER = "No such container"
 
 
 class EngineError(Exception):
@@ -290,19 +298,31 @@ class ReapSelection:
 class RemovalReport:
     """What `remove_env` actually did to `name`'s containers, by name.
 
-    `reaped` - orphaned floci-child containers it removed. `spared` -
-    floci-child-prefixed containers it saw and deliberately left alone:
-    they might belong to another live environment, they predate `target`,
-    or one literally IS another tracked environment's own parent container
-    (see `select_children_to_reap`'s docstring for exactly which). `unparsed`
-    - `docker ps` rows whose CreatedAt this engine could not parse at all;
-    left untouched rather than guessed at (see `_parse_docker_ps_output`).
-    Every list here holds container names, not environment names.
+    `reaped` - floci-child containers `remove_env` confirmed it actually
+    removed. `spared` - floci-child-prefixed containers it saw and
+    deliberately left alone: they might belong to another live
+    environment, they predate `target`, or one literally IS another
+    tracked environment's own parent container (see
+    `select_children_to_reap`'s docstring for exactly which) - FALLBACK
+    path only, always `[]` on the PRIMARY path (nothing is ambiguous when
+    the exact list is already recorded). `unparsed` - `docker ps` rows
+    whose CreatedAt this engine could not parse at all; left untouched
+    rather than guessed at (see `_parse_docker_ps_output`) - also FALLBACK
+    path only. `already_gone` - PRIMARY path only: recorded children whose
+    `docker rm -f` reported the container already didn't exist (a prior
+    `destroy()`, or a human, already removed it) - kept distinct from
+    `reaped` rather than silently folded into it, so a caller can see this
+    happened ("visible truth, not silence") instead of `reaped` echoing
+    `target.children` regardless of what `docker rm -f` actually did.
+    Always `[]` on the FALLBACK path, which never checks individual
+    removal outcomes. Every list here holds container names, not
+    environment names.
     """
 
     reaped: list[str]
     spared: list[str]
     unparsed: list[str]
+    already_gone: list[str] = field(default_factory=list)
 
 
 def _is_floci_child(name: str) -> bool:
@@ -464,13 +484,19 @@ def remove_env(name: str) -> RemovalReport:
     recorded (see `EnvState.children`'s own docstring for exactly what
     `None` versus `[]` means):
 
-    - PRIMARY (`target.children is not None`): reap exactly that list, no
-      more, no less. `tf_runner.apply`'s before/after `docker ps` delta
-      already knows precisely which containers this environment's own
-      terraform spawned - there is nothing left to guess, so nothing is
-      spared and nothing is unparsed. A name already gone (removed by a
-      prior `destroy()`, or by hand) is the same best-effort no-op the
-      parent container's own removal above already is.
+    - PRIMARY (`target.children is not None`): attempt `docker rm -f` on
+      exactly that list, no more, no less, and report each one HONESTLY
+      by what actually happened - `reaped` if it was genuinely removed,
+      `already_gone` if it was not there to remove (a prior `destroy()`,
+      or a human, already removed it). This does NOT mean "returncode
+      nonzero" - verified directly against a real daemon (docker 29.6.2):
+      `docker rm -f <missing>` exits 0 (not an error) while still writing
+      "No such container" to stderr, whereas a real removal exits 0 with
+      the name on stdout and empty stderr - so the classification below
+      keys off stderr content, never returncode, which cannot tell the
+      two apart for `-f`. Nothing is spared and nothing is unparsed on
+      this path - there is nothing ambiguous left to guess once the exact
+      list is already known.
     - FALLBACK (`target.children is None`, i.e. never recorded - an
       environment from before this field existed, or one nothing has ever
       been applied to): the original `created_at`-based heuristic sweep,
@@ -496,10 +522,16 @@ def remove_env(name: str) -> RemovalReport:
     run_docker(["rm", "-f", container_name(name)])  # best-effort: already-gone is fine.
 
     if target.children is not None:
+        reaped: list[str] = []
+        already_gone: list[str] = []
         for child_name in target.children:
-            run_docker(["rm", "-f", child_name])
+            result = run_docker(["rm", "-f", child_name])
+            if _NO_SUCH_CONTAINER_MARKER in result.stderr:
+                already_gone.append(child_name)
+            else:
+                reaped.append(child_name)
         state.delete_env_dir(name)
-        return RemovalReport(reaped=list(target.children), spared=[], unparsed=[])
+        return RemovalReport(reaped=reaped, spared=[], unparsed=[], already_gone=already_gone)
 
     # Includes `target` itself (its state.json is not deleted yet) -
     # select_children_to_reap excludes it from "other" on its own.
@@ -515,4 +547,5 @@ def remove_env(name: str) -> RemovalReport:
         reaped=[row.name for row in selection.reap],
         spared=[row.name for row in selection.spare],
         unparsed=unparsed,
+        already_gone=[],  # a PRIMARY-path-only concept; this path never checks individual outcomes.
     )

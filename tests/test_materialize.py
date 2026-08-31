@@ -206,6 +206,37 @@ def test_emit_terraform_with_an_empty_spec_still_produces_a_valid_provider_only_
     assert "resource " not in tf_source
 
 
+# --- the count meta-argument mechanism (what the XL profile actually relies on) ---
+
+
+def test_emit_terraform_uses_the_count_meta_argument_for_a_group_with_count_greater_than_one():
+    # This is the ACTUAL mechanism random_spec("XL", ...) depends on: one
+    # resource BLOCK per spec group, terraform's own `count` meta-argument
+    # fanning it out to many real resources - never N separate blocks (see
+    # emit_terraform's own docstring). A group of `count=1` (every other
+    # test in this file) can't distinguish "count is wired up" from "count
+    # is just always 1" - this one uses count=3 specifically to prove it.
+    spec = EnvSpec(
+        name_prefix="xl-demo",
+        vpcs=[VpcSpec(cidr="10.0.0.0/16", subnets=[SubnetSpec(cidr="10.0.0.0/24", az_suffix="a")])],
+        instances=[InstanceSpec(subnet_index=0, instance_type="t3.micro", count=3)],
+        buckets=[BucketSpec(name_hint="data", count=3)],
+    )
+
+    tf_source = emit_terraform(spec, _env())
+
+    # Exactly one block per group - not three - with terraform's own count
+    # meta-argument set to 3, and ${count.index} in the per-item name so
+    # the 3 real resources it expands to don't collide with each other.
+    assert tf_source.count('resource "aws_instance" "xl-demo-instance-0"') == 1
+    assert "count         = 3" in tf_source
+    assert 'Name = "xl-demo-instance-0-${count.index}"' in tf_source
+
+    assert tf_source.count('resource "aws_s3_bucket" "xl-demo-bucket-0"') == 1
+    assert "count  = 3" in tf_source
+    assert 'bucket = "xl-demo-data-0-${count.index}"' in tf_source
+
+
 # --- name_prefix shape: enforced at the EnvSpec boundary, honored verbatim here ---
 
 
@@ -268,3 +299,53 @@ def test_emit_terraform_slugifies_a_hostile_bucket_name_hint():
     assert match is not None
     bucket_name_value = match.group(1)
     assert re.fullmatch(r"[a-z0-9${}.-]+", bucket_name_value)
+
+
+def test_emit_terraform_neutralizes_hcl_interpolation_syntax_in_a_hostile_az_suffix():
+    # Finding 6: a second, distinct injection class from the quote-breakout
+    # tests above. HCL scans a string literal's own CONTENT for `${...}`
+    # (interpolation) and `%{...}` (a directive) even AFTER proper
+    # backslash/quote escaping - json.dumps has no idea these exist, since
+    # they are not JSON syntax at all. A hostile az_suffix containing a
+    # literal `${aws_iam_role.evil.arn}` would, if left unescaped, have
+    # terraform evaluate that expression for REAL once applied - a live
+    # cross-resource reference, not inert text - which is a materially
+    # worse outcome than merely breaking the string open. `az_suffix` goes
+    # straight through `_hcl_string` (unlike name_hint, which is slugged
+    # to [a-z0-9-] first and so never reaches this gap at all).
+    hostile_az_suffix = "a${aws_iam_role.evil.arn}"
+    spec = EnvSpec(
+        name_prefix="interp-demo",
+        vpcs=[
+            VpcSpec(
+                cidr="10.0.0.0/16",
+                subnets=[SubnetSpec(cidr="10.0.0.0/24", az_suffix=hostile_az_suffix)],
+            )
+        ],
+    )
+
+    tf_source = emit_terraform(spec, _env())
+
+    # HCL's own documented escape for a literal dollar-brace is `$${` -
+    # that neutralized form must be what actually appears in the emitted
+    # availability_zone string.
+    assert "$${aws_iam_role.evil.arn}" in tf_source
+    # The live, unescaped form - which terraform would actually evaluate -
+    # must never appear.
+    assert "us-east-1a${aws_iam_role.evil.arn}" not in tf_source
+
+
+def test_emit_terraform_neutralizes_a_hostile_percent_brace_directive_in_instance_type():
+    # The `%{...}` half of the same gap (an HCL template directive, e.g.
+    # `%{if ...}...%{endif}`) - HCL's own documented escape is `%%{`.
+    hostile_instance_type = "t3.micro%{if true}pwned%{endif}"
+    spec = EnvSpec(
+        name_prefix="interp-demo-2",
+        vpcs=[VpcSpec(cidr="10.0.0.0/16", subnets=[SubnetSpec(cidr="10.0.0.0/24", az_suffix="a")])],
+        instances=[InstanceSpec(subnet_index=0, instance_type=hostile_instance_type, count=1)],
+    )
+
+    tf_source = emit_terraform(spec, _env())
+
+    assert "%%{if true}" in tf_source
+    assert "t3.micro%{if true}pwned%{endif}" not in tf_source
