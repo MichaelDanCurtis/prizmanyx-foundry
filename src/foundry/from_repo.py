@@ -157,7 +157,13 @@ def _clone_repo(url: str, dest: Path) -> None:
     files straight to a tmp_path - no git process, no network, involved at
     all.
     """
-    result = run_git(["clone", "--depth", "1", url, str(dest)])
+    # The explicit "--" marks the end of options: defense-in-depth against a
+    # hostile url starting with "-" ever reaching git as a flag rather than
+    # the repository argument it is meant to be. `_validate_https_url`
+    # already rejects anything that is not a genuine https:// URL before
+    # this runs, so no url shaped like a flag can arrive here today - this
+    # is a second, independent line of defense, not a fix for a reachable bug.
+    result = run_git(["clone", "--depth", "1", "--", url, str(dest)])
     if result.returncode != 0:
         raise RepoCloneError(f"git clone failed: {result.stderr.strip()}")
 

@@ -475,7 +475,28 @@ def test_clone_repo_asks_git_for_a_shallow_clone(tmp_path, monkeypatch):
 
     _clone_repo("https://example.com/repo.git", dest)
 
-    assert recorded == [["clone", "--depth", "1", "https://example.com/repo.git", str(dest)]]
+    assert recorded == [["clone", "--depth", "1", "--", "https://example.com/repo.git", str(dest)]]
+
+
+def test_clone_repo_argv_carries_an_explicit_end_of_options_marker(tmp_path, monkeypatch):
+    # Task 5's deferred minor: defense-in-depth against a leading-dash url
+    # ever reaching git as a flag, on top of (not instead of)
+    # _validate_https_url's own rejection of anything that is not a genuine
+    # https:// URL - this is the second, independent line of defense.
+    recorded: list[list[str]] = []
+
+    def _recording_git(args, *, timeout=None):  # noqa: ARG001
+        recorded.append(args)
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("foundry.from_repo.run_git", _recording_git)
+
+    _clone_repo("https://example.com/repo.git", tmp_path / "dest")
+
+    argv = recorded[0]
+    assert "--" in argv
+    # It must precede the url, or it does not mark the url as a positional.
+    assert argv.index("--") < argv.index("https://example.com/repo.git")
 
 
 def test_run_git_forces_git_terminal_prompt_off_regardless_of_the_ambient_environment(monkeypatch):
