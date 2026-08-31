@@ -267,3 +267,53 @@ if this project's licensing posture ever tightens — a swap of the image
 reference in `tf_runner.TERRAFORM_IMAGE` plus a golden re-check, nothing
 structural. **No action now**; recorded so the option is a known one rather
 than a rediscovery.
+
+---
+
+## 004 — estates carry an `Application` tag because unit inference is tag-seeded
+
+**Date:** 2026-08-31
+
+**Question.** A live Task 8 acceptance run walked the whole loop —
+extract, ingest, discover, catalog — and stalled at `poll_exit_gate`:
+`units_approved.approved = 0`, every other exit-gate condition vacuously
+true. The estate discovered cleanly (19 graph nodes), but zero migration
+units were ever inferred from it. Why, and whose responsibility is it to
+fix?
+
+**Finding.** Traced through
+`packages/discovery/prizmanyx_discovery/migration_units.py` (Prizmanyx
+repo): migration-unit inference is **deterministic and tag-seeded, not
+graph-shape-seeded**. `_group_signal` (line 254) reads
+`node.properties.get("tags")` and looks for the first key, in order, from
+`GROUP_TAG_KEYS = ("Application", "application", "App", "app",
+"Workload", "workload", "Service", "service")` (lines 11-20) whose value
+is a non-empty string; a node with none of those keys returns `(None,
+"no deterministic grouping signal")` and joins no unit at all. This
+generator's `emit_terraform` set no tags on any resource before this
+entry — so every one of the 19 nodes hit that `None` path, unconditionally.
+A cloud graph can be perfectly extracted and still be **structurally
+unmigratable** if nothing in it carries the signal the migration pipeline
+groups on.
+
+**Decision.** `materialize.emit_terraform` now tags every TAGGABLE
+resource it emits (`aws_vpc`, `aws_subnet`, `aws_instance`,
+`aws_db_instance`, `aws_s3_bucket`, `aws_sqs_queue`, `aws_iam_role`) with
+`Application = "<spec.name_prefix>"` — one shared value across the whole
+estate, deliberately: `_group_signal`'s grouping is by tag VALUE, so a
+single value joins every resource into ONE coherent migration unit
+(which then pulls in hard-dependency neighbors via the inference's own
+edge-walking) — the realistic "one small estate, one application" shape
+this generator's specs already model. `name_prefix` is already
+boundary-validated (`envspec._NAME_PREFIX_PATTERN`), so it reaches this
+tag value with no new validation surface. Modeling more than one
+application per estate (per-resource-group tagging, a spec-level `roles[
+].application` field, etc.) is explicitly **out of scope** for slices
+1-3 — a real seam if a later slice ever needs multi-unit estates, but not
+one this fix builds ahead of need.
+
+**Consequence, stated plainly:** an estate materialized by any prior
+commit of this generator carries no `Application` tag and will infer zero
+migration units when run through Prizmanyx's discovery pipeline — it is
+extractable but not migratable. Every estate materialized from this
+commit forward carries the tag on every resource that supports one.

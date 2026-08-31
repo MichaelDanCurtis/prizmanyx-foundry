@@ -75,6 +75,36 @@ def _hcl_string(value: str) -> str:
     return escaped.replace("${", "$${").replace("%{", "%%{")
 
 
+def _application_tag_line(spec: EnvSpec) -> str:
+    """The `Application = "<name_prefix>"` tag line every taggable
+    resource's own `tags` block includes.
+
+    Not cosmetic: `prizmanyx_discovery.migration_units.GROUP_TAG_KEYS`
+    (Application/application/App/app/Workload/workload/Service/service)
+    is what seeds Prizmanyx's DETERMINISTIC migration-unit inference - a
+    graph node whose extracted `properties["tags"]` carries none of those
+    keys with a non-empty value joins NO migration unit at all
+    (`_group_signal` in that module returns `None`). A materialized
+    estate with no such tag on any resource yields zero units, and the
+    loop's exit gate can never pass (`units_approved` has nothing to
+    approve) - this is exactly what a live Task 8 acceptance run hit: 19
+    graph nodes, 0 units. Every taggable resource this generator emits
+    must carry this tag for a materialized estate to actually be
+    migratable, not merely extractable.
+
+    Every resource gets the SAME value - `spec.name_prefix` - on purpose:
+    the inference groups candidate nodes by tag VALUE, so one shared
+    value joins every resource in this spec into ONE coherent migration
+    unit (which also pulls in hard-dependency neighbors via the
+    inference's own edge-walking) - the realistic "one small estate, one
+    application" shape this generator's specs already model. Modeling
+    more than one application per estate is deliberately out of scope for
+    slice 1-3; `name_prefix` is already boundary-validated
+    (`_NAME_PREFIX_PATTERN`), so it reaches this tag value safely.
+    """
+    return f"    Application = {_hcl_string(spec.name_prefix)}"
+
+
 def _slug(text: str) -> str:
     """Lowercase `text` down to `[a-z0-9-]`, collapsing everything else to
     a single hyphen - used only for the human-readable half of an S3
@@ -126,7 +156,13 @@ def _vpc_blocks(spec: EnvSpec) -> list[str]:
     for index, vpc in enumerate(spec.vpcs):
         label = f"{spec.name_prefix}-vpc-{index}"
         blocks.append(
-            f'resource "aws_vpc" "{label}" {{\n  cidr_block = {_hcl_string(vpc.cidr)}\n}}'
+            f'resource "aws_vpc" "{label}" {{\n'
+            f"  cidr_block = {_hcl_string(vpc.cidr)}\n"
+            "\n"
+            "  tags = {\n"
+            f"{_application_tag_line(spec)}\n"
+            "  }\n"
+            "}"
         )
     return blocks
 
@@ -149,6 +185,10 @@ def _subnet_blocks(spec: EnvSpec) -> list[str]:
                 f"  vpc_id            = aws_vpc.{vpc_label}.id\n"
                 f"  cidr_block        = {_hcl_string(subnet.cidr)}\n"
                 f"  availability_zone = {_hcl_string(availability_zone)}\n"
+                "\n"
+                "  tags = {\n"
+                f"{_application_tag_line(spec)}\n"
+                "  }\n"
                 "}"
             )
             flat_index += 1
@@ -170,6 +210,7 @@ def _instance_blocks(spec: EnvSpec) -> list[str]:
             "\n"
             "  tags = {\n"
             f'    Name = "{name_tag}"\n'
+            f"{_application_tag_line(spec)}\n"
             "  }\n"
             "}"
         )
@@ -193,6 +234,10 @@ def _database_blocks(spec: EnvSpec) -> list[str]:
             f"  username            = {_hcl_string(_DEFAULT_DB_USERNAME)}\n"
             f"  password            = {_hcl_string(_DEFAULT_DB_PASSWORD)}\n"
             "  skip_final_snapshot = true\n"
+            "\n"
+            "  tags = {\n"
+            f"{_application_tag_line(spec)}\n"
+            "  }\n"
             "}"
         )
     return blocks
@@ -209,6 +254,10 @@ def _bucket_blocks(spec: EnvSpec) -> list[str]:
             f'resource "aws_s3_bucket" "{label}" {{\n'
             f"  count  = {bucket.count}\n"
             f'  bucket = "{bucket_name}"\n'
+            "\n"
+            "  tags = {\n"
+            f"{_application_tag_line(spec)}\n"
+            "  }\n"
             "}"
         )
     return blocks
@@ -223,6 +272,10 @@ def _queue_blocks(spec: EnvSpec) -> list[str]:
             f'resource "aws_sqs_queue" "{label}" {{\n'
             f"  count = {queue.count}\n"
             f'  name  = "{queue_name}"\n'
+            "\n"
+            "  tags = {\n"
+            f"{_application_tag_line(spec)}\n"
+            "  }\n"
             "}"
         )
     return blocks
@@ -246,6 +299,10 @@ def _role_blocks(spec: EnvSpec) -> list[str]:
             '      Principal = { Service = "ec2.amazonaws.com" }\n'
             "    }]\n"
             "  })\n"
+            "\n"
+            "  tags = {\n"
+            f"{_application_tag_line(spec)}\n"
+            "  }\n"
             "}"
         )
     return blocks

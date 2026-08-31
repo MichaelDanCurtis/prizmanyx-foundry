@@ -68,6 +68,19 @@ def _two_instance_s_spec(name_prefix: str = "foundry-test") -> EnvSpec:
     )
 
 
+def _resource_block(tf_source: str, header: str) -> str:
+    """The full text of one resource block, from `header` up to (but not
+    including) the next top-level `resource "..."` declaration, or the end
+    of the string if `header` is the last block. Robust to a block's own
+    internal blank lines (e.g. the blank line before an `aws_instance`'s
+    `tags {}` section) that a naive search for the next "\\n\\n" would
+    mistake for the block's end.
+    """
+    start = tf_source.index(header)
+    next_start = tf_source.find('\nresource "', start + 1)
+    return tf_source[start:] if next_start == -1 else tf_source[start:next_start]
+
+
 # --- determinism -------------------------------------------------------
 
 
@@ -150,6 +163,76 @@ def test_emit_terraform_contains_exactly_the_expected_resource_blocks_for_the_s_
     assert tf_source.count('resource "aws_s3_bucket"') == 2
     assert tf_source.count('resource "aws_sqs_queue"') == 1
     assert tf_source.count('resource "aws_iam_role"') == 1
+
+
+# --- the Application tag: the deterministic migration-unit inference seed ---
+
+
+def test_emit_terraform_tags_every_taggable_resource_with_application_equal_to_name_prefix():
+    # Prizmanyx's migration-unit inference is tag-seeded
+    # (packages/discovery/prizmanyx_discovery/migration_units.py,
+    # GROUP_TAG_KEYS: Application/application/App/app/Workload/workload/
+    # Service/service) - a graph node whose properties["tags"] carries
+    # none of those keys with a non-empty value joins NO migration unit at
+    # all. A materialized estate with no such tag anywhere yields zero
+    # units and can never pass the loop's exit gate (units_approved has
+    # nothing to approve) - confirmed live during Task 8 acceptance:
+    # 19 graph nodes, 0 units. Every taggable resource this generator
+    # emits (aws_vpc, aws_subnet, aws_instance, aws_db_instance,
+    # aws_s3_bucket, aws_sqs_queue, aws_iam_role) must carry
+    # Application=<name_prefix> for a materialized estate to actually be
+    # migratable, not merely extractable.
+    spec = _two_instance_s_spec("tag-demo")
+
+    tf_source = emit_terraform(spec, _env())
+
+    taggable_resource_headers = [
+        'resource "aws_vpc" "tag-demo-vpc-0"',
+        'resource "aws_subnet" "tag-demo-subnet-0"',
+        'resource "aws_subnet" "tag-demo-subnet-1"',
+        'resource "aws_instance" "tag-demo-instance-0"',
+        'resource "aws_instance" "tag-demo-instance-1"',
+        'resource "aws_db_instance" "tag-demo-database-0"',
+        'resource "aws_s3_bucket" "tag-demo-bucket-0"',
+        'resource "aws_s3_bucket" "tag-demo-bucket-1"',
+        'resource "aws_sqs_queue" "tag-demo-queue-0"',
+        'resource "aws_iam_role" "tag-demo-role-0"',
+    ]
+    for header in taggable_resource_headers:
+        assert 'Application = "tag-demo"' in _resource_block(tf_source, header), header
+
+    # Exactly one Application tag per taggable resource - not accidentally
+    # duplicated within a block, not missing from one.
+    assert tf_source.count('Application = "tag-demo"') == len(taggable_resource_headers)
+
+
+def test_emit_terraform_instance_tags_block_carries_both_name_and_application():
+    # aws_instance already had its own `tags { Name = ... }` block before
+    # this tag existed - proving the two coexist in ONE tags block, not
+    # that Application silently replaced Name or landed in a second one.
+    spec = _two_instance_s_spec("merge-demo")
+
+    tf_source = emit_terraform(spec, _env())
+
+    block = _resource_block(tf_source, 'resource "aws_instance" "merge-demo-instance-0"')
+    assert block.count("tags = {") == 1
+    assert 'Name = "merge-demo-instance-0-${count.index}"' in block
+    assert 'Application = "merge-demo"' in block
+
+
+def test_emit_terraform_application_tag_determinism_and_name_prefix_scoping():
+    spec = _two_instance_s_spec("determinism-demo")
+    env = _env()
+
+    first = emit_terraform(spec, env)
+    second = emit_terraform(spec, env)
+
+    assert first == second
+    # One shared value across every resource, by design: the inference
+    # groups candidate nodes by tag VALUE, so a single Application value
+    # joins them all into one coherent migration unit.
+    assert first.count('Application = "determinism-demo"') == 10
+    assert "Application = " not in first.replace('Application = "determinism-demo"', "")
 
 
 def test_emit_terraform_instances_reference_their_own_subnet_by_subnet_index():
