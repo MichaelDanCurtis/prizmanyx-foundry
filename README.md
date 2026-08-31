@@ -36,14 +36,18 @@ These are load-bearing and apply to every line of code added to this repo:
 
 ## Status
 
-The environment engine, EnvSpec (hand-written and seeded-random), both
-materializers (spec and from-repo) and the lifecycle commands exist. The
-Prizmanyx pipeline client and the loop driver (`foundry run`) are later
-slices — see the plan this repo is being built from (tracked in the
-Prizmanyx repo's
-`docs/superpowers/plans/2026-08-30-foundry-slices-1-3.md`) for the full
-slice breakdown, and `docs/DECISIONS.md` for the probe results and design
-calls they build on.
+Slices 1–3 are complete: the environment engine, EnvSpec (hand-written and
+seeded-random), both materializers (spec and from-repo), the lifecycle
+commands, the Prizmanyx pipeline client, and the loop driver (`foundry run`)
+that walks the full extract → discover → gate → translate → export →
+deploy-preview pipeline against a running Prizmanyx and returns a PASS/FAIL
+verdict. A live acceptance run against the dev backend passed end to end —
+see `docs/ACCEPTANCE.md` (and the four real integration findings it caught).
+The deploy+verify leg against emulated **Azure** is slice 4 and awaits the
+ARM adapter (`docs/superpowers/specs/2026-08-30-floci-cloud-testing-design.md`
+in the Prizmanyx repo, the *As decided* note); a local web UI is slice 5.
+`docs/DECISIONS.md` carries the probe results and design calls the whole tool
+builds on.
 
 ```bash
 uv sync
@@ -58,8 +62,25 @@ uv run foundry create demo \
   --path examples/aws-mini
 
 uv run foundry ls          # every tracked environment, with LIVE container status
+
+# Drive Prizmanyx's pipeline against the environment and get a verdict:
+export FOUNDRY_PRIZMANYX_USER=admin FOUNDRY_PRIZMANYX_PASSWORD=prizmanyx-dev
+uv run foundry run demo --prizmanyx http://localhost:8000
+# → PASS/FAIL, with a per-step + per-decision report written into the env dir.
+
 uv run foundry rm demo     # container, attributable children, state dir
 ```
+
+`foundry run` is a scripted operator: it logs in, registers the environment
+as an AWS connection (at the **worker-reachable** endpoint —
+`host.docker.internal:<port>`, since Prizmanyx's extraction runs in a
+container, overridable with `--worker-host`), and walks every human gate with
+a recorded default (accept-catalog-defaults, approve, rehost, the four
+sign-offs). The estate it materializes carries an `Application` tag on every
+resource because Prizmanyx's deterministic unit inference is tag-seeded — an
+untagged estate yields zero migration units (`docs/DECISIONS.md` entry 004).
+The report is the honesty surface: a failure names the first failing step
+verbatim and marks every later step `UNRUN`, never faked.
 
 `--from-repo` clones any https git repository and applies **its** terraform
 at **this** environment's floci endpoints, by injecting an `override.tf`
