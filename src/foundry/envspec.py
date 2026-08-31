@@ -170,7 +170,28 @@ def total_resource_count(spec: EnvSpec) -> int:
 
 
 _AZ_SUFFIXES = ("a", "b", "c")
-_INSTANCE_TYPES = ("t3.micro", "t3.small", "t3.medium", "m5.large", "m5.xlarge")
+
+# Vocabulary pinned to the EC2 instance types VALIDATED against the pinned
+# floci image digest (`engine.DEFAULT_FLOCI_IMAGE`) by direct probe on
+# 2026-08-31 - not to "plausible AWS types". floci's DescribeInstanceTypes
+# answers each of these with one row; it answered `m5.xlarge` (previously
+# listed here) with ZERO rows, and the terraform AWS provider turns that
+# empty result into a hard apply failure - "reading EC2 Instance Type
+# (m5.xlarge): empty result" - so any (size, seed) pair that drew it
+# produced a spec that could not be materialized at all. Measured before
+# removal: 12 of 30 S-seeds affected, seed 42 among them, which is the
+# foundry plan's own acceptance seed.
+#
+# A generated estate that cannot APPLY is not a smaller estate, it is a
+# broken one; that is why this list is emulator-validated rather than
+# aspirational. REVISIT ON ANY FLOCI IMAGE UPGRADE: probe
+# `describe_instance_types` against the new digest before widening this,
+# and update docs/DECISIONS.md entry 003 with the new transcript date.
+# tests/test_envspec.py carries its own independent copy of the validated
+# set, on purpose - a test importing this tuple could not catch a bad
+# addition to it.
+_INSTANCE_TYPES = ("t3.micro", "t3.small", "t3.medium", "m5.large")
+
 _DB_ENGINES = ("postgres", "mysql")
 _DB_INSTANCE_CLASSES = ("db.t3.micro", "db.t3.small", "db.r5.large")
 _BUCKET_WORDS = ("data", "logs", "backups", "assets", "artifacts", "exports")

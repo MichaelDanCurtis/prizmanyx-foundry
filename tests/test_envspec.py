@@ -82,6 +82,34 @@ def test_random_spec_never_produces_a_negative_count(size):
     assert all(count >= 0 for count in counts)
 
 
+# The EC2 instance types floci can actually APPLY, established by direct
+# probe against the pinned floci image on 2026-08-31 (see docs/DECISIONS.md
+# entry 003). Written out as a literal here, deliberately NOT imported from
+# `envspec._INSTANCE_TYPES` - importing the generator's own vocabulary would
+# make this test tautological, unable to catch exactly the regression it
+# exists for (a plausible-looking AWS type added to that tuple that floci's
+# DescribeInstanceTypes answers with zero rows, which the terraform AWS
+# provider turns into a hard apply failure).
+FLOCI_APPLIABLE_INSTANCE_TYPES = frozenset({"t3.micro", "t3.small", "t3.medium", "m5.large"})
+
+
+@pytest.mark.parametrize("size", SIZES)
+@pytest.mark.parametrize("seed", range(10))
+def test_random_spec_only_ever_draws_instance_types_floci_can_apply(size, seed):
+    # The generator's contract is that its estates APPLY against floci - a
+    # spec that cannot be materialized is not a smaller estate, it is a
+    # broken one. `m5.xlarge` was in this vocabulary and affected 12 of 30
+    # S-seeds (40%), including seed 42, which is the plan's own acceptance
+    # seed; the failure only ever surfaced at `terraform apply` time.
+    spec = random_spec(size, seed=seed)
+    assert spec.instances, "expected at least one instance group to assert over"
+    drawn = {instance.instance_type for instance in spec.instances}
+    assert drawn <= FLOCI_APPLIABLE_INSTANCE_TYPES, (
+        f"{size}/seed {seed} drew {sorted(drawn - FLOCI_APPLIABLE_INSTANCE_TYPES)}, "
+        "which floci's DescribeInstanceTypes answers with zero rows"
+    )
+
+
 @pytest.mark.parametrize("size", SIZES)
 def test_random_spec_subnet_indices_are_always_in_range(size):
     spec = random_spec(size, seed=99)

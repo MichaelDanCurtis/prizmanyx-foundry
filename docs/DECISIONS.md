@@ -205,3 +205,65 @@ reason it does there, since this URL becomes `git clone <url>` argv. Clones
 are transient (made in a temp dir inside the env's own 0o700 state
 directory, removed on the way out, success or failure), which is the same
 discipline `clone_scan_parse_terraform` applies to its own.
+
+---
+
+## 003 — the generator's vocabulary is emulator-validated; terraform stays an external BUSL tool
+
+**Date:** 2026-08-31
+
+**Finding.** `foundry create <name> --random S --seed 42` — the literal
+command in the foundry plan's own Task 8 acceptance step — failed at
+`terraform apply`:
+
+```
+Error: reading EC2 Instance Type (m5.xlarge): empty result
+  with aws_instance.foundry-s-42-instance-1[0],
+  on main.tf line 55, in resource "aws_instance" "foundry-s-42-instance-1"
+```
+
+Probed directly against a live container on the pinned floci digest,
+`describe_instance_types` returns **one row** for `t3.micro`, `t3.small`,
+`t3.medium` and `m5.large`, and **zero rows** for `m5.xlarge`. The terraform
+AWS provider turns that empty result into a hard apply failure. Since
+`envspec._INSTANCE_TYPES` listed `m5.xlarge`, any (size, seed) pair drawing
+it produced a spec that could not be materialized: **12 of 30 S-seeds (40%)**
+were affected, seed 42 among them. The failure was invisible until apply
+time — Task 4's own docker acceptance uses a hand-written `t3.micro` spec,
+which is why it never surfaced there.
+
+**Decision.** `m5.xlarge` is removed from the generator's vocabulary, and
+that vocabulary is now **pinned to types validated against the pinned floci
+image digest** (probe transcript date 2026-08-31) rather than to plausible
+AWS types. The reasoning is a contract point, not a preference: the design's
+promise is that a random estate *applies* against the environment, so a
+generator that can emit an unappliable type contradicts the spec itself — a
+generated estate that cannot apply is not a smaller estate, it is a broken
+one. **Revisit on any floci image upgrade:** probe `describe_instance_types`
+against the new digest before widening the tuple, and record the new
+transcript date here.
+
+The regression test (`tests/test_envspec.py`,
+`test_random_spec_only_ever_draws_instance_types_floci_can_apply`,
+all four sizes × seeds 0-9) carries its **own literal copy** of the
+validated set rather than importing `_INSTANCE_TYPES` — a test importing the
+generator's own vocabulary could not catch a bad addition to it. Against the
+old tuple that test failed 32 of its 40 cases.
+
+Dropping a type changes the generated spec for some (size, seed) pairs.
+That is accepted: determinism is a promise about *reproducibility* — the
+same (size, seed) always yields the same spec in any process — not about
+permanent stability of the drawn content across generator versions, and no
+persisted spec depends on the old draws today.
+
+**Terraform's licence posture, recorded here to close the plan's Global
+Constraint.** The terraform CLI is **BUSL-1.1**. This repo never vendors,
+bundles, redistributes or ships it: every invocation is
+`docker run --rm hashicorp/terraform:1.9` against a pinned public image,
+i.e. use of an external tool, which is outside the BUSL's competing-use
+restriction for an internal test-estate manufacturer. **OpenTofu**
+(MPL-2.0) is a drop-in fork of the same CLI surface and is the alternative
+if this project's licensing posture ever tightens — a swap of the image
+reference in `tf_runner.TERRAFORM_IMAGE` plus a golden re-check, nothing
+structural. **No action now**; recorded so the option is a known one rather
+than a rediscovery.
