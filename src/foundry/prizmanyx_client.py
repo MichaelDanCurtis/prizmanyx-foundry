@@ -681,3 +681,56 @@ class PrizmanyxClient:
             },
         )
         return response.json()
+
+    # ------------------------------------------------------------------
+    # Verify — app.py:6595 (GET .../expected-resources), :6521 (POST .../verify)
+    # ------------------------------------------------------------------
+
+    def list_translation_resources(self, translation_id: int) -> JSONList:
+        """The EXPECTED Azure resources for one translation - each row's
+        `azure_resource_type` (the `azure_native.*` token), `azure_logical_name`,
+        and rendered `azure_properties` - exactly what the foundry's ARM
+        materializer PUTs into floci-az before a verify.
+
+        Reads `GET /api/v1/translations/{id}/expected-resources`
+        (app.py:6595-6611), returning the route's `"resources"` array
+        unwrapped. Deliberately NOT `.../resources`: that path is already
+        `list_translated_resources`, which serves the full review rows the
+        frontend depends on (app.py:6494-6502) - a different shape entirely.
+        """
+        response = self._request(
+            "list_translation_resources",
+            "GET",
+            f"/api/v1/translations/{translation_id}/expected-resources",
+        )
+        return response.json()["resources"]
+
+    def verify_translation(
+        self,
+        translation_id: int,
+        *,
+        azure_subscription_id: str,
+        azure_resource_group: str,
+    ) -> JSONObject:
+        """Re-extract `azure_resource_group` over ARM and diff it against this
+        translation's expected resources, INLINE (app.py:6521). Returns the
+        `VerifyResponse` counts: `{verification_run_id, all_matched,
+        matched_count, mismatch_count, missing_count, extra_count}`.
+
+        A 502 (never 500) is the server's honest "the bridge can't reach or
+        read Azure" signal - the worker not configured, floci-az unreachable,
+        or a real ARM error - carrying the bridge's own message. `_request`
+        surfaces it as `LoopStepError("verify", 502, <detail verbatim>)` like
+        any other non-2xx, so the loop can tell that apart from a genuine
+        mismatch (a 200 with `all_matched: false`).
+        """
+        response = self._request(
+            "verify",
+            "POST",
+            f"/api/v1/translations/{translation_id}/verify",
+            json_body={
+                "azure_subscription_id": azure_subscription_id,
+                "azure_resource_group": azure_resource_group,
+            },
+        )
+        return response.json()

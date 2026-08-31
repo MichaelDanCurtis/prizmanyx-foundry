@@ -547,6 +547,139 @@ def test_deploy_preview_posts_expected_path_with_placeholder_azure_fields():
     assert result["mode"] == "preview"
 
 
+# --- verify: the expected-resources read + the inline verify POST ---------
+# Both paths read from the merged Track B routes (PR #334) in the Prizmanyx
+# repo next to this one:
+#   GET  /api/v1/translations/{id}/expected-resources
+#        -> packages/api/prizmanyx_api/app.py:6595-6611 (list_expected_resources_route,
+#           returns {"resources": [...]}) — deliberately NOT /resources, which
+#           list_translated_resources already owns (app.py:6494-6502).
+#   POST /api/v1/translations/{id}/verify
+#        -> packages/api/prizmanyx_api/app.py:6521 (verify_translation_route,
+#           VerifyRequest body {azure_subscription_id, azure_resource_group},
+#           VerifyResponse counts; 502 — never 500 — when the bridge can't reach
+#           floci-az / the worker is unconfigured, detail verbatim, app.py:6533-6568).
+
+
+def test_list_translation_resources_gets_expected_resources_path_and_returns_the_array():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        return httpx.Response(
+            200,
+            json={
+                "resources": [
+                    {
+                        "azure_resource_type": "azure_native.storage.StorageAccount",
+                        "azure_logical_name": "sa_bucket_1",
+                        "azure_properties": {"location": "eastus"},
+                    }
+                ]
+            },
+        )
+
+    client = _client(handler)
+    result = client.list_translation_resources(99)
+
+    assert captured["method"] == "GET"
+    # /expected-resources, NOT /resources (that path is taken by
+    # list_translated_resources — app.py:6494-6502).
+    assert captured["path"] == "/api/v1/translations/99/expected-resources"
+    assert result == [
+        {
+            "azure_resource_type": "azure_native.storage.StorageAccount",
+            "azure_logical_name": "sa_bucket_1",
+            "azure_properties": {"location": "eastus"},
+        }
+    ]
+
+
+def test_verify_translation_posts_expected_path_and_body_and_returns_the_counts():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "verification_run_id": 12,
+                "all_matched": True,
+                "matched_count": 3,
+                "mismatch_count": 0,
+                "missing_count": 0,
+                "extra_count": 0,
+            },
+        )
+
+    client = _client(handler)
+    result = client.verify_translation(
+        99, azure_subscription_id="sub-1", azure_resource_group="rg-1"
+    )
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == "/api/v1/translations/99/verify"
+    assert captured["body"] == {
+        "azure_subscription_id": "sub-1",
+        "azure_resource_group": "rg-1",
+    }
+    assert result == {
+        "verification_run_id": 12,
+        "all_matched": True,
+        "matched_count": 3,
+        "mismatch_count": 0,
+        "missing_count": 0,
+        "extra_count": 0,
+    }
+
+
+def test_verify_translation_502_surfaces_the_bridge_detail_verbatim():
+    # 502 is the honest "the worker can't reach floci-az / the worker is not
+    # configured" signal (app.py:6533-6568) — the bridge's own message must
+    # arrive verbatim, not folded into a generic error.
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(502, json={"detail": "ARM endpoint http://floci-az:8080 unreachable"})
+
+    client = _client(handler)
+
+    with pytest.raises(LoopStepError) as excinfo:
+        client.verify_translation(99, azure_subscription_id="sub-1", azure_resource_group="rg-1")
+
+    assert excinfo.value.step == "verify"
+    assert excinfo.value.status == 502
+    assert excinfo.value.detail_verbatim == "ARM endpoint http://floci-az:8080 unreachable"
+
+
+def test_verify_translation_carries_the_session_cookie_from_login():
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == "/api/v1/auth/login":
+            return _login_ok(request)
+        return httpx.Response(
+            200,
+            json={
+                "verification_run_id": 1,
+                "all_matched": True,
+                "matched_count": 0,
+                "mismatch_count": 0,
+                "missing_count": 0,
+                "extra_count": 0,
+            },
+        )
+
+    client = _client(handler)
+    client.login()
+    client.verify_translation(99, azure_subscription_id="sub-1", azure_resource_group="rg-1")
+
+    # httpx.Client's own cookie jar carries it — same as every other call.
+    assert "pzx_session=test-session-token" in calls[1].headers.get("cookie", "")
+
+
 # --- poll helpers: return on success, raise LoopStepError on timeout ------
 
 
