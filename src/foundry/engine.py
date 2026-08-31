@@ -30,7 +30,7 @@ import yaml
 
 from foundry import state
 from foundry.envspec import EnvSpec
-from foundry.state import CHILD_NAME_PREFIXES, EnvState
+from foundry.state import AZ_CONTAINER_PREFIX, CHILD_NAME_PREFIXES, EnvState
 
 # Global Constraints: the spike-validated digest, overridable only through
 # this named escape hatch - never trust an unpinned `floci/floci:latest`.
@@ -144,11 +144,14 @@ def container_name(name: str) -> str:
 
 def az_container_name(name: str) -> str:
     """The docker container name for environment `name`'s Azure (floci-az)
-    control plane. Shares the `floci-` prefix - so it appears in the
+    control plane. Built from `state.AZ_CONTAINER_PREFIX` - the SAME string
+    state's `validate_env_name` forbids as an env-name stem, so an env can
+    never be named such that its AWS parent `floci-<name>` equals another
+    env's `floci-az-<...>`. Shares the `floci-` prefix - so it appears in the
     `docker ps --filter name=floci-` reap sweep - but is NOT one of
     CHILD_NAME_PREFIXES; `select_children_to_reap` protects a live peer's az
     parent via `other_parent_names`, exactly like its AWS parent."""
-    return f"floci-az-{name}"
+    return f"{AZ_CONTAINER_PREFIX}{name}"
 
 
 def allocate_port(start: int = PORT_RANGE_START, end: int = PORT_RANGE_END) -> int:

@@ -103,6 +103,33 @@ def test_create_env_rejects_a_child_prefix_colliding_name_without_calling_docker
         create_env("rds-evil", EnvSpec(name_prefix="demo"))
 
 
+def test_create_env_rejects_an_az_prefix_colliding_name_without_calling_docker(monkeypatch):
+    # The create-time blast radius, closed at the boundary: an "az-"-prefixed
+    # name must be refused BEFORE `create_env` issues any `docker rm -f` -
+    # otherwise it would delete a live peer env's healthy floci-az container.
+    def _must_not_be_called(args: list[str]) -> subprocess.CompletedProcess[str]:
+        raise AssertionError(f"run_docker should not be called, got {args!r}")
+
+    monkeypatch.setattr("foundry.engine.run_docker", _must_not_be_called)
+
+    with pytest.raises(InvalidEnvNameError):
+        create_env("az-foo", EnvSpec(name_prefix="demo"))
+
+
+def test_az_container_prefix_matches_the_forbidden_name_stem_no_drift():
+    # Anti-drift pin: the container prefix engine.az_container_name joins is
+    # the SAME string state's name validation forbids as an env-name stem.
+    # If a future rename moves one without the other, this collision reopens
+    # silently - so they share one source of truth (state.AZ_CONTAINER_PREFIX)
+    # and this test proves the coupling holds.
+    assert az_container_name("foo") == f"{state.AZ_CONTAINER_PREFIX}foo"
+    # The forbidden env-name stem is exactly that prefix minus "floci-", so
+    # `container_name("<stem>foo")` reproduces `az_container_name("foo")` -
+    # which is the very collision the stem ban exists to prevent.
+    forbidden_stem = state.AZ_CONTAINER_PREFIX.removeprefix("floci-")
+    assert container_name(f"{forbidden_stem}foo") == az_container_name("foo")
+
+
 # --- allocate_port -----------------------------------------------------------
 
 

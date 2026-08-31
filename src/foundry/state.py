@@ -53,43 +53,77 @@ _CHILD_PREFIX_STEMS: tuple[str, ...] = tuple(
     prefix.removeprefix("floci-") for prefix in CHILD_NAME_PREFIXES
 )
 
+# The floci-az (Azure control plane) container prefix - `engine.az_container_name`
+# joins it as `floci-az-<name>`. Defined HERE, and imported by engine.py, for
+# the SAME reason CHILD_NAME_PREFIXES is: this module's name validation must
+# forbid the `az-` env-name stem. An env named e.g. `az-foo` gets its AWS
+# parent container `floci-<name>` = `floci-az-foo` - BYTE-IDENTICAL to env
+# `foo`'s Azure parent `floci-az-foo`. That collision is catastrophic at
+# CREATE time, not just at reap: `create_env`'s stale-container clear
+# (`docker rm -f floci-az-foo`) would delete a DIFFERENT, live env's healthy
+# Azure container. Reject the name shape at the boundary before any docker
+# call. One source of truth, so the container-naming prefix and the naming
+# rule that avoids colliding with it can never drift apart.
+AZ_CONTAINER_PREFIX = "floci-az-"
+
+# The full set of env-name stems that are forbidden because `floci-<name>`
+# would collide with a RESERVED floci container namespace: the child-container
+# prefixes (rds-/ec2-/elasticache-) AND the az parent prefix (`az-`). Derived
+# from the prefixes themselves so it cannot drift from them.
+_FORBIDDEN_NAME_STEMS: tuple[str, ...] = (
+    *_CHILD_PREFIX_STEMS,
+    AZ_CONTAINER_PREFIX.removeprefix("floci-"),
+)
+
 FOUNDRY_HOME = Path.home() / ".prizmanyx-foundry"
 ENVS_DIR = FOUNDRY_HOME / "envs"
 
 
 class InvalidEnvNameError(ValueError):
     """Raised when a candidate environment name does not match ENV_NAME_PATTERN
-    or would collide with floci's own child-container naming."""
+    or would collide with a reserved floci container-name prefix (a child
+    prefix like `rds-`, or the `az-` Azure-parent prefix)."""
 
 
 def validate_env_name(name: str) -> None:
     """Raise InvalidEnvNameError if `name` is not a safe environment name.
 
     Two independent checks: `name` must match ENV_NAME_PATTERN, AND `name`
-    must not start with a CHILD_NAME_PREFIXES stem (e.g. `rds-`) - otherwise
-    `floci-<name>` (this environment's own parent container) would be
-    indistinguishable by name from one of floci's emulated-resource child
-    containers, and engine.py's child-reap sweep could mistake a live
-    peer's parent container for an orphan (see CHILD_NAME_PREFIXES's own
-    comment, and `engine.select_children_to_reap`'s docstring, for exactly
-    what that costs).
+    must not start with any `_FORBIDDEN_NAME_STEMS` entry - a child-container
+    stem (e.g. `rds-`) OR the `az-` Azure-parent stem - because in either
+    case `floci-<name>` (this environment's own AWS parent container) would
+    collide by name with a RESERVED floci container namespace:
+
+    - a child stem (`rds-`/`ec2-`/`elasticache-`): `floci-<name>` looks
+      like one of floci's emulated-resource backing containers, and
+      engine.py's child-reap sweep could mistake this live parent container
+      for an orphan (see CHILD_NAME_PREFIXES's comment and
+      `engine.select_children_to_reap`).
+    - the `az-` stem: `floci-az-<rest>` is byte-identical to some OTHER
+      env's Azure parent container (`engine.az_container_name`). This one
+      bites at CREATE time - `create_env`'s stale-container clear would
+      `docker rm -f` a different, live env's healthy floci-az container.
+      This unconditional boundary refusal is the fix for that collision.
 
     Called from `engine.create_env` before anything else happens (fail
     fast, before a port is allocated or a container started) and again
     here, by every function in this module that turns a name into a
     filesystem path - belt and suspenders against a name ever reaching a
-    shell command or a path join unchecked.
+    shell command or a path join unchecked. Note "starts with", not
+    "contains": `azure-demo`, `azfoo`, and a bare `az` are all safe - only
+    the `az-` PREFIX yields the `floci-az-` collision.
     """
     if not _ENV_NAME_RE.fullmatch(name):
         raise InvalidEnvNameError(
             f"invalid environment name {name!r}: must match {ENV_NAME_PATTERN}"
         )
-    if name.startswith(_CHILD_PREFIX_STEMS):
+    if name.startswith(_FORBIDDEN_NAME_STEMS):
         raise InvalidEnvNameError(
             f"invalid environment name {name!r}: must not start with any of "
-            f"{_CHILD_PREFIX_STEMS!r} (floci-{name} would collide with floci's own "
-            "child-container naming - CHILD_NAME_PREFIXES - and could be mistaken for "
-            "an emulated resource's backing container when a peer environment is removed)"
+            f"{_FORBIDDEN_NAME_STEMS!r} (floci-{name} would collide with a reserved "
+            "floci container-name prefix - a child container - CHILD_NAME_PREFIXES - "
+            "or the floci-az- Azure-parent prefix, and could delete or mis-reap "
+            "another environment's container)"
         )
 
 

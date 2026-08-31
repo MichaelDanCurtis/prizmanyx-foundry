@@ -64,10 +64,10 @@ def test_save_then_load_round_trips_a_state_carrying_an_az_port():
     # - `az` is not special-cased anywhere in the schema, it is just another
     # entry in the open `ports` map, and this pins that it survives the
     # round trip.
-    original = _sample_state(name="az-enabled", ports={"aws": 15600, "az": 14577})
+    original = _sample_state(name="azure-env", ports={"aws": 15600, "az": 14577})
     save_state(original)
 
-    loaded = load_state("az-enabled")
+    loaded = load_state("azure-env")
 
     assert loaded == original
     assert loaded.ports == {"aws": 15600, "az": 14577}
@@ -182,3 +182,27 @@ def test_validate_env_name_accepts_a_name_that_merely_contains_a_stem_mid_string
     # the first character is not a collision (floci-my-rds-clone does not
     # start with floci-rds-).
     validate_env_name("my-rds-clone")  # must not raise
+
+
+# --- env name / az-prefix collision rejection -----------------------------
+# CRITICAL create-time collision: az_container_name("foo") == "floci-az-foo"
+# == container_name("az-foo"). An env named "az-foo" gets AWS parent
+# container "floci-az-foo", byte-identical to env "foo"'s AZURE container -
+# so create_env's stale-container clear (`docker rm -f floci-az-foo`) would
+# DELETE a different, live env's healthy Azure container. Reject the "az-"
+# name prefix at the boundary, before any docker call can fire.
+
+
+@pytest.mark.parametrize("name", ["az-foo", "az-anything", "az-", "az-x", "az-eastus"])
+def test_validate_env_name_rejects_the_az_prefix_colliding_with_floci_az_containers(name):
+    with pytest.raises(InvalidEnvNameError, match="az-"):
+        validate_env_name(name)
+
+
+@pytest.mark.parametrize("name", ["azure-demo", "azfoo", "az", "azalea", "azure", "azov"])
+def test_validate_env_name_accepts_az_names_that_do_not_start_with_the_az_hyphen_prefix(name):
+    # Precision: ONLY the "az-" prefix (the one that produces the floci-az-
+    # collision) is forbidden - not any name merely containing or starting
+    # with "az". "azure-demo", "azfoo", and a bare "az" are all safe: none
+    # yields a container name of the form container_name("az-<something>").
+    validate_env_name(name)  # must not raise
