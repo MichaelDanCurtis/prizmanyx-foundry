@@ -88,6 +88,45 @@ _PIPELINE_RUN_TERMINAL_STATUSES = frozenset({"succeeded", "failed", "canceled"})
 _PREVIEW_PLACEHOLDER_SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
 _PREVIEW_PLACEHOLDER_RESOURCE_GROUP = "foundry-preview-rg"
 
+# packages/api/prizmanyx_api/auth.py:14 - SESSION_COOKIE = "pzx_session".
+# Duplicated here (not imported) because this client has no dependency on
+# the Prizmanyx package itself - it is an external operator, deliberately
+# decoupled from the product's own code.
+_SESSION_COOKIE_NAME = "pzx_session"
+
+# Browsers treat "localhost", 127.0.0.1, and ::1 as a "potentially
+# trustworthy origin" (the Secure Contexts spec's loopback exception) and
+# will send a Secure-flagged cookie back to one of these hosts even over
+# plain http - it is the ONLY reason Prizmanyx's own UI works at all against
+# a plaintext dev backend on http://localhost. httpx has no such exception:
+# it is a faithful RFC 6265 client, and RFC 6265 alone says a Secure cookie
+# is never sent over http, loopback host or not (`http.cookiejar`'s
+# `return_ok_secure`, called on every real request, checks only the
+# request's scheme). Confirmed against a live dev backend (Task 8
+# acceptance): `login()` got 200 + `Set-Cookie: ...; Secure`, the cookie was
+# stored, and the very next call got 401 with no Cookie header at all -
+# httpx's jar had silently withheld it. `_is_loopback_http` below is this
+# client's own version of the browser's exception, applied ONLY where the
+# browser would apply it - see its own docstring for why both conditions
+# (scheme AND host) are required, not just one.
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _is_loopback_http(url: httpx.URL) -> bool:
+    """True if `url` is plain http to a loopback host - the one case where
+    this client must replicate the browser's Secure-cookie loopback
+    exception, because httpx otherwise won't.
+
+    Both conditions are required, mirroring the browser rule exactly: an
+    https base gets ordinary Secure-cookie handling regardless of host
+    (Secure's own requirement is already satisfied by TLS), and a
+    non-loopback http base gets ordinary handling too - there is no
+    exception for it, in a browser or here, and inventing one would be
+    exactly the "globally disable cookie security" this must not do.
+    """
+    return url.scheme == "http" and url.host in _LOOPBACK_HOSTS
+
+
 #: The complete disposition vocabulary (app.py:6047's PUT .../disposition,
 #: enforced server-side by disposition_store.set_disposition - a ValueError
 #: there becomes this route's 422). Typed here for editor/type-checker help
@@ -186,6 +225,12 @@ class PrizmanyxClient:
         self._password = password if password is not None else os.environ.get(_PASSWORD_ENV_VAR)
         self._log_sink = log
         self._client = httpx.Client(base_url=base_url, timeout=timeout, transport=transport)
+        self._loopback_http = _is_loopback_http(self._client.base_url)
+        # Set True by `_carry_loopback_session_cookie` the moment `login()`
+        # actually finds and de-secures the session cookie on a
+        # loopback-http base. Stays False when this base needs no
+        # workaround at all, or if login has not happened yet.
+        self._loopback_cookie_carried = False
 
     def __enter__(self) -> PrizmanyxClient:
         try:
@@ -267,7 +312,15 @@ class PrizmanyxClient:
 
     def login(self) -> JSONObject:
         """Sign in and let `httpx.Client`'s own cookie jar carry the session
-        cookie on every subsequent call made through this instance."""
+        cookie on every subsequent call made through this instance.
+
+        On a loopback-http base (see `_is_loopback_http`), the jar alone is
+        not enough - the real session cookie is `Secure`, and httpx's jar
+        will never volunteer a `Secure` cookie over plain http, browser
+        loopback exception or not. `_carry_loopback_session_cookie` fixes
+        this once, right here, so every later call needs no special-casing
+        at all - it just goes through the jar exactly like any other call.
+        """
         if not self._user or not self._password:
             raise LoopStepError(
                 "login",
@@ -280,7 +333,35 @@ class PrizmanyxClient:
             "/api/v1/auth/login",
             json_body={"username": self._user, "password": self._password},
         )
+        if self._loopback_http:
+            self._carry_loopback_session_cookie()
         return response.json()
+
+    def _carry_loopback_session_cookie(self) -> None:
+        """After a successful login on a loopback-http base, flip the real
+        session cookie's own `Secure` flag off, in place, inside the jar.
+
+        This mutates the EXACT `http.cookiejar.Cookie` object the login
+        response's `Set-Cookie` header already caused the jar to store,
+        correctly scoped to the right domain and path by httpx itself - it
+        does not construct a fresh lookalike cookie. That distinction
+        matters: `http.cookiejar` silently appends `.local` to a bareword
+        host like "localhost" when it computes a cookie's domain (verified
+        empirically against this exact host), so an attempt to re-set a
+        same-named cookie with a hand-guessed `domain="localhost"` creates
+        a SECOND, non-colliding jar entry that never matches any real
+        request instead of replacing the first - a foot-gun this sidesteps
+        entirely by never re-deriving the domain at all.
+
+        Once flipped, `http.cookiejar`'s own gate for sending a cookie back
+        (`return_ok_secure`: `cookie.secure and request.type != "https"`)
+        is satisfied trivially, and the ordinary jar mechanism carries the
+        cookie on every later call with no per-request code of any kind.
+        """
+        for cookie in self._client.cookies.jar:
+            if cookie.name == _SESSION_COOKIE_NAME:
+                cookie.secure = False
+                self._loopback_cookie_carried = True
 
     # ------------------------------------------------------------------
     # Program — app.py:1742 (POST /api/v1/programs)

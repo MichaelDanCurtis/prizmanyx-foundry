@@ -685,3 +685,148 @@ def test_log_sink_records_the_status_of_a_failed_call_too():
             "status": 404,
         }
     ]
+
+
+# --- the browser loopback-Secure exception, replicated for a dev backend ---
+#
+# Task 8 live acceptance: the real backend's login sets `pzx_session=...;
+# HttpOnly; Path=/; SameSite=lax; Secure`. httpx is a faithful RFC 6265
+# client - `http.cookiejar`'s `return_ok_secure` withholds ANY Secure cookie
+# from a plain-http request, loopback host or not - so login() got 200, the
+# cookie was stored, and the very next call got 401 with the cookie silently
+# dropped. Browsers do not have this problem because they treat localhost /
+# 127.0.0.1 / ::1 as a "potentially trustworthy origin" (the Secure Contexts
+# spec's loopback exception) and send Secure cookies there anyway even over
+# plain http - which is the ONLY reason Prizmanyx's own UI works against a
+# plaintext dev backend at http://localhost:8000 at all. These tests pin
+# that same exception onto this client, loopback-http only.
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("http://localhost:8000", True),
+        ("http://127.0.0.1:8000", True),
+        ("http://[::1]:8000", True),
+        # https already satisfies Secure's own requirement regardless of
+        # host - the browser exception exists for http specifically, and
+        # inventing a broader one here would be exactly the "globally
+        # disable cookie security" this fix must NOT do.
+        ("https://localhost:8000", False),
+        ("https://127.0.0.1:8000", False),
+        # A non-loopback host gets ordinary handling over http too - there
+        # is no exception for it, in a browser or here.
+        ("http://prizmanyx.example.com", False),
+        ("https://prizmanyx.example.com", False),
+    ],
+)
+def test_loopback_http_detection_matches_the_browsers_own_exception_exactly(base_url, expected):
+    def _unused(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        raise AssertionError("this test makes no HTTP calls")
+
+    client = PrizmanyxClient(
+        base_url, "admin", "prizmanyx-dev", transport=httpx.MockTransport(_unused)
+    )
+
+    assert client._loopback_http is expected
+
+
+def _secure_login_ok(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+    # The exact Set-Cookie shape Task 8 observed from the live backend.
+    return httpx.Response(
+        200,
+        json={"id": 1, "username": "admin", "display_name": "Admin", "role": "admin"},
+        headers={
+            "set-cookie": (
+                "pzx_session=loopback-secret; HttpOnly; Max-Age=43200; Path=/; SameSite=lax; Secure"
+            )
+        },
+    )
+
+
+def test_secure_session_cookie_is_still_sent_on_the_next_call_over_loopback_http():
+    # THE reproduction: base_url is http://localhost, exactly Task 8's dev
+    # backend. Without the fix, httpx's own jar withholds the Secure cookie
+    # on this second request and it arrives with no Cookie header at all -
+    # this test is red against the pre-fix client.
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == "/api/v1/auth/login":
+            return _secure_login_ok(request)
+        return httpx.Response(200, json={"id": 7, "status": "running"})
+
+    client = PrizmanyxClient(
+        "http://localhost:8000", "admin", "prizmanyx-dev", transport=httpx.MockTransport(handler)
+    )
+    client.login()
+    client.get_pipeline_run(7)
+
+    assert client._loopback_cookie_carried is True
+    assert "pzx_session=loopback-secret" in calls[1].headers.get("cookie", "")
+
+
+def test_secure_session_cookie_is_sent_over_loopback_http_via_127_0_0_1_too():
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == "/api/v1/auth/login":
+            return _secure_login_ok(request)
+        return httpx.Response(200, json={"id": 7, "status": "running"})
+
+    client = PrizmanyxClient(
+        "http://127.0.0.1:8000",
+        "admin",
+        "prizmanyx-dev",
+        transport=httpx.MockTransport(handler),
+    )
+    client.login()
+    client.get_pipeline_run(7)
+
+    assert "pzx_session=loopback-secret" in calls[1].headers.get("cookie", "")
+
+
+def test_secure_session_cookie_over_a_remote_https_base_uses_ordinary_jar_untouched():
+    # Regression guard for the "do NOT globally disable cookie security"
+    # requirement: over https, httpx's own jar already carries a Secure
+    # cookie correctly with no help needed - this proves the new code path
+    # never engages for it (`_loopback_cookie_carried` stays False), not
+    # merely that the cookie happens to arrive.
+    calls: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if request.url.path == "/api/v1/auth/login":
+            return _secure_login_ok(request)
+        return httpx.Response(200, json={"id": 7, "status": "running"})
+
+    client = PrizmanyxClient(
+        "https://prizmanyx.example.com",
+        "admin",
+        "prizmanyx-dev",
+        transport=httpx.MockTransport(handler),
+    )
+    client.login()
+    client.get_pipeline_run(7)
+
+    assert client._loopback_cookie_carried is False
+    assert "pzx_session=loopback-secret" in calls[1].headers.get("cookie", "")
+
+
+def test_https_on_a_loopback_host_does_not_engage_the_workaround_either():
+    # Both conditions (http AND loopback) are required - a loopback HOST
+    # alone must not be enough, or this would silently widen the exception
+    # beyond what browsers themselves do.
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/auth/login":
+            return _secure_login_ok(request)
+        return httpx.Response(200, json={"id": 7, "status": "running"})
+
+    client = PrizmanyxClient(
+        "https://localhost:8443", "admin", "prizmanyx-dev", transport=httpx.MockTransport(handler)
+    )
+    client.login()
+
+    assert client._loopback_cookie_carried is False
