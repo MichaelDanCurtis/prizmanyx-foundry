@@ -22,7 +22,7 @@ from foundry.loop import (
     run_loop,
 )
 from foundry.prizmanyx_client import LoopStepError
-from foundry.report import FIDELITY_LINE, load_report, write_report
+from foundry.report import FIDELITY_LINE, load_report, render_markdown, write_report
 from foundry.state import EnvState, env_dir
 
 
@@ -50,9 +50,13 @@ class _FakeClient:
     structurally - every method the loop calls, none of the polling/HTTP
     machinery `PrizmanyxClient` itself needs.
 
-    `translate_fails_at`, when set, makes `translate_unit` raise a
-    `LoopStepError` for that one migration unit id (and only that one) -
-    the fixture behind the "409 at translate" test.
+    `translate_fails_at`/`approve_fails_at`, when set, make `translate_unit`/
+    `approve_unit` raise a `LoopStepError` for that one migration unit id
+    (and only that one) - the fixtures behind the "409 at translate" and
+    "failure at a non-boundary unit" tests. `translation_never_appears_for`
+    makes `list_translations` return empty forever for that one unit id,
+    forcing `_poll_translation_id` to exhaust its attempt budget and time
+    out - the fixture behind the partial-translation-ids test.
     """
 
     def __init__(
@@ -60,10 +64,14 @@ class _FakeClient:
         *,
         units: list[dict[str, object]] | None = None,
         translate_fails_at: int | None = None,
+        approve_fails_at: int | None = None,
+        translation_never_appears_for: int | None = None,
     ) -> None:
         self.calls: list[str] = []
         self._units = units if units is not None else [{"id": 1}, {"id": 2}]
         self._translate_fails_at = translate_fails_at
+        self._approve_fails_at = approve_fails_at
+        self._translation_never_appears_for = translation_never_appears_for
         # Populated as the loop calls through - every parameter below is
         # captured somewhere rather than silently accepted-and-dropped, so
         # a test can assert on exactly what the loop sent without this
@@ -109,6 +117,8 @@ class _FakeClient:
 
     def approve_unit(self, unit_id):
         self.calls.append(f"approve_unit:{unit_id}")
+        if self._approve_fails_at is not None and unit_id == self._approve_fails_at:
+            raise LoopStepError("approve_unit", 409, f"migration unit {unit_id} is not reviewable")
         return {"id": unit_id, "review_status": "approved"}
 
     def decide_disposition(self, unit_id, disposition="rehost"):
@@ -135,6 +145,8 @@ class _FakeClient:
 
     def list_translations(self, unit_id):
         self.calls.append(f"list_translations:{unit_id}")
+        if unit_id == self._translation_never_appears_for:
+            return []
         return [{"id": 100 + unit_id, "migration_unit_id": unit_id}]
 
     def export_program(self, program_id, fmt="csv"):
@@ -318,6 +330,76 @@ def test_a_409_at_translate_aborts_the_batch_the_second_unit_is_never_called():
     assert "translate_unit:2" not in client.calls
 
 
+def test_a_failure_at_a_non_boundary_unit_in_a_longer_roster_preserves_earlier_progress():
+    # 5 units, failure at unit 3 (neither the first nor the last) - proves
+    # the abort-on-first-failure behavior generalizes past a 2-unit roster
+    # where "first" and "next-to-last" are indistinguishable.
+    units = [{"id": i} for i in range(1, 6)]
+    client = _FakeClient(units=units, approve_fails_at=3)
+    report = run_loop(_env(), client)
+
+    assert report.verdict == "FAIL"
+    assert report.failed_step == "approve"
+    assert report.failure_detail == "migration unit 3 is not reviewable"
+
+    statuses = _step_statuses(report)
+    for name in STEP_ORDER[: STEP_ORDER.index("approve")]:
+        assert statuses[name] == "PASSED", f"{name} should have PASSED before the failure"
+    assert statuses["approve"] == "FAILED"
+    for name in STEP_ORDER[STEP_ORDER.index("approve") + 1 :]:
+        assert statuses[name] == "UNRUN", f"{name} must be recorded UNRUN, not absent or faked"
+
+    # Units 1-2 were genuinely approved before unit 3 failed; units 4-5
+    # were never attempted once the batch aborted.
+    assert "approve_unit:1" in client.calls
+    assert "approve_unit:2" in client.calls
+    assert "approve_unit:3" in client.calls
+    assert "approve_unit:4" not in client.calls
+    assert "approve_unit:5" not in client.calls
+
+    # list_units itself succeeded in full - only the approve BATCH aborted
+    # partway through - so all five ids are known to the report.
+    assert report.unit_ids == [1, 2, 3, 4, 5]
+
+    # Decisions carry accept_catalog_defaults's own (it precedes approve in
+    # STEP_ORDER and genuinely ran) plus exactly the 1-2 approve successes -
+    # no decision for unit 3 (it failed, nothing was decided) and none for
+    # the never-attempted 4-5.
+    assert report.decisions == [
+        Decision(step="accept_catalog_defaults", choice="accept-defaults", detail=""),
+        Decision(step="approve", choice="approve", detail="unit 1"),
+        Decision(step="approve", choice="approve", detail="unit 2"),
+    ]
+
+
+# --- a translation timeout mid-batch preserves ids already resolved -------
+# (the same honesty rule "decisions" already gets: partial progress made
+# before a failure must survive that failure, never collapse to empty.)
+
+
+def test_a_translation_timeout_preserves_the_id_already_resolved_before_it():
+    client = _FakeClient(translation_never_appears_for=2)
+    report = run_loop(_env(), client, translation_poll_max_attempts=2, translation_poll_interval=0)
+
+    assert report.verdict == "FAIL"
+    assert report.failed_step == "poll_translations"
+    # Unit 1 resolved to translation id 101 BEFORE unit 2's poll exhausted
+    # its budget - that resolved id must not be lost just because the batch
+    # as a whole did not finish.
+    assert report.translation_ids == [101]
+
+    statuses = _step_statuses(report)
+    for name in STEP_ORDER[: STEP_ORDER.index("poll_translations")]:
+        assert statuses[name] == "PASSED", f"{name} should have PASSED before the failure"
+    assert statuses["poll_translations"] == "FAILED"
+    for name in STEP_ORDER[STEP_ORDER.index("poll_translations") + 1 :]:
+        assert statuses[name] == "UNRUN", f"{name} must be recorded UNRUN, not absent or faked"
+
+    # Unit 2 was polled exactly twice (the max_attempts budget given) before
+    # the loop gave up - never zero, never unbounded.
+    assert client.calls.count("list_translations:2") == 2
+
+
 # --- a terminal pipeline-run status other than "succeeded" is a FAIL too --
 # (PrizmanyxClient.poll_pipeline_run does not raise for this itself - the
 # loop is the layer responsible for treating "failed" as a real failure.)
@@ -386,6 +468,44 @@ def test_write_report_creates_the_directory_if_it_does_not_exist_yet(tmp_path):
 
     assert md_path.is_file()
     assert json_path.is_file()
+
+
+def test_a_multiline_detail_is_neutralized_in_markdown_but_faithful_in_json(tmp_path):
+    # A raw embedded newline inside a table cell splits that row across two
+    # lines of the rendered file, corrupting every row below it - _escape_cell
+    # must fold it into something that stays on one line. report.json has no
+    # such structural constraint, so the raw newline must survive there.
+    two_line_detail = "line one\nline two"
+    report = LoopReport(
+        env_name="demo",
+        verdict="FAIL",
+        failed_step="translate",
+        failure_detail=two_line_detail,
+        steps=[
+            StepResult(
+                name="translate", status="FAILED", duration_seconds=0.1, detail=two_line_detail
+            )
+        ],
+        decisions=[Decision(step="approve", choice="approve", detail="unit 1\nunit 2")],
+        started_at=datetime(2026, 1, 1, tzinfo=UTC),
+        finished_at=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+    text = render_markdown(report)
+
+    assert "line one<br>line two" in text
+    assert "unit 1<br>unit 2" in text
+    # Exactly one rendered line per table row - a raw "\n" in the cell would
+    # have produced two lines for "translate"'s row instead of one.
+    assert len([line for line in text.splitlines() if line.startswith("| translate ")]) == 1
+    assert len([line for line in text.splitlines() if line.startswith("| approve ")]) == 1
+
+    write_report(report, tmp_path)
+    reloaded = load_report(tmp_path)
+
+    assert reloaded.failure_detail == two_line_detail
+    assert reloaded.steps[0].detail == two_line_detail
+    assert reloaded.decisions[0].detail == "unit 1\nunit 2"
 
 
 def test_step_result_and_decision_are_plain_pydantic_models_with_expected_defaults():

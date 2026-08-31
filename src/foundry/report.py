@@ -34,7 +34,22 @@ def _format_duration(seconds: float | None) -> str:
 
 
 def _escape_cell(text: str) -> str:
-    return text.replace("|", "\\|") if text else ""
+    """Make `text` safe to sit inside one Markdown table cell.
+
+    A raw embedded newline splits a `| ... |` row across two physical
+    lines, corrupting every row rendered after it - a multi-line
+    `failure_detail` (a stack trace, a multi-line server error) is exactly
+    the kind of text this needs to survive. `\\r\\n` is folded before the
+    lone `\\n`/`\\r` replacements so a single Windows line ending never
+    produces two markers. This only affects the Markdown rendering -
+    `report.json` carries the original text untouched (`LoopReport.
+    model_dump_json`, never routed through this function), so nothing here
+    trades fidelity for cosmetics.
+    """
+    if not text:
+        return ""
+    escaped = text.replace("|", "\\|")
+    return escaped.replace("\r\n", "<br>").replace("\n", "<br>").replace("\r", "<br>")
 
 
 def _render_step_row(step: StepResult) -> str:

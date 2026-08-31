@@ -136,7 +136,12 @@ class LoopReport(BaseModel):
     `steps` always has exactly `len(STEP_ORDER)` entries, in that order,
     regardless of verdict. `failed_step`/`failure_detail` are set together
     and only on `FAIL` - `failure_detail` is the failing `LoopStepError`'s
-    own `detail_verbatim`, never reworded.
+    own `detail_verbatim`, never reworded. `decisions`, `unit_ids`, and
+    `translation_ids` all reflect real, already-happened progress even on a
+    `FAIL`: a batch that fails partway through (an approval, a translate, a
+    translation-id poll) leaves every entry it genuinely produced before the
+    failure in the report - none of these ever collapse to empty just
+    because the batch as a whole did not finish.
     """
 
     env_name: str
@@ -399,18 +404,22 @@ def run_loop(
 
         _step("translate", _translate_every_unit)
 
-        def _poll_every_translation() -> list[int]:
-            return [
-                _poll_translation_id(
-                    client,
-                    unit_id,
-                    max_attempts=translation_poll_max_attempts,
-                    interval=translation_poll_interval,
+        def _poll_every_translation() -> None:
+            # Appends to the OUTER translation_ids list as each unit resolves,
+            # exactly like `decisions` above - so a timeout on unit N still
+            # leaves units 1..N-1's real, already-resolved ids in the report
+            # instead of collapsing the whole batch's progress to nothing.
+            for unit_id in unit_ids:
+                translation_ids.append(
+                    _poll_translation_id(
+                        client,
+                        unit_id,
+                        max_attempts=translation_poll_max_attempts,
+                        interval=translation_poll_interval,
+                    )
                 )
-                for unit_id in unit_ids
-            ]
 
-        translation_ids = _step("poll_translations", _poll_every_translation)
+        _step("poll_translations", _poll_every_translation)
 
         def _export_pack() -> str:
             response = client.export_program(program_id, fmt=_EXPORT_FORMAT)
