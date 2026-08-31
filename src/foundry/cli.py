@@ -32,7 +32,17 @@ from foundry.engine import (
 )
 from foundry.envspec import EnvSpec, SpecLoadError, load_spec, random_spec
 from foundry.from_repo import FromRepoError, materialize_from_repo, placeholder_spec
+from foundry.loop import run_loop
+from foundry.prizmanyx_client import PrizmanyxClient
+from foundry.report import write_report
+from foundry.state import env_dir
 from foundry.tf_runner import ApplyResult, apply
+
+# `foundry run`'s own default - Prizmanyx's own dev launch command
+# (`uv run uvicorn prizmanyx_api.main:app --port 8000`, per its
+# .claude/launch.json and CI) listens here; overridable with `--prizmanyx`
+# for anything else.
+_DEFAULT_PRIZMANYX_URL = "http://localhost:8000"
 
 app = typer.Typer(
     help=(
@@ -245,6 +255,45 @@ def rm_command(
     _echo_report_field("already gone", report.already_gone)
     _echo_report_field("spared", report.spared)
     _echo_report_field("unparsed", report.unparsed)
+
+
+@app.command("run")
+def run_command(
+    name: Annotated[
+        str, typer.Argument(help="Environment to run the Prizmanyx pipeline loop against.")
+    ],
+    prizmanyx: Annotated[
+        str,
+        typer.Option("--prizmanyx", help="Base URL of the running Prizmanyx instance."),
+    ] = _DEFAULT_PRIZMANYX_URL,
+) -> None:
+    """Run the full Prizmanyx pipeline loop against ENV and report PASS/FAIL.
+
+    Operator credentials come from FOUNDRY_PRIZMANYX_USER/
+    FOUNDRY_PRIZMANYX_PASSWORD (see prizmanyx_client's module docstring) -
+    never a CLI flag, so they never land in shell history. `run_loop` itself
+    never raises `LoopStepError`: a failing step becomes part of the written
+    report, not an exception here - so the only failure this command handles
+    itself is ENV not being a tracked environment at all.
+    """
+    try:
+        env = env_status(name)
+    except _OPERATOR_ERRORS as exc:
+        raise _fail(str(exc)) from exc
+
+    client = PrizmanyxClient(prizmanyx)
+    try:
+        report = run_loop(env, client)
+    finally:
+        client.close()
+
+    md_path, _json_path = write_report(report, env_dir(name))
+    typer.echo(f"verdict: {report.verdict}")
+    typer.echo(f"report: {md_path}")
+
+    if report.verdict == "FAIL":
+        typer.echo(f"failed step: {report.failed_step} ({report.failure_detail})", err=True)
+        raise _fail(f"loop run against {name!r} did not pass")
 
 
 if __name__ == "__main__":

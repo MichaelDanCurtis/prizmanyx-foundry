@@ -23,6 +23,7 @@ from typer.testing import CliRunner
 from foundry import cli
 from foundry.engine import EnvNotFoundError, EnvStartError, RemovalReport
 from foundry.envspec import EnvSpec
+from foundry.loop import Decision, LoopReport, StepResult
 from foundry.state import EnvState
 from foundry.tf_runner import ApplyResult
 
@@ -374,6 +375,157 @@ def test_rm_of_an_unknown_environment_fails_with_a_message(monkeypatch):
     assert "Traceback" not in result.output
 
 
+# --- run ----------------------------------------------------------------
+# `run_loop` and `write_report` are monkeypatched throughout - what this
+# file pins is the CLI's OWN job (resolve the environment, hand it and a
+# real client to run_loop, print the verdict, exit non-zero on FAIL), not
+# the loop's internal pipeline walk, which is tests/test_loop.py's job.
+
+
+def _now():
+    return datetime(2026, 1, 1, tzinfo=UTC)
+
+
+def _pass_report(env_name: str = "demo") -> LoopReport:
+    return LoopReport(
+        env_name=env_name,
+        verdict="PASS",
+        steps=[StepResult(name="login", status="PASSED", duration_seconds=0.01)],
+        decisions=[Decision(step="accept_catalog_defaults", choice="accept-defaults")],
+        program_id=7,
+        graph_run_id=55,
+        unit_ids=[1],
+        translation_ids=[101],
+        artifact_paths=["/envs/demo/export.csv"],
+        started_at=_now(),
+        finished_at=_now(),
+    )
+
+
+def _fail_report(env_name: str = "demo") -> LoopReport:
+    return LoopReport(
+        env_name=env_name,
+        verdict="FAIL",
+        failed_step="translate",
+        failure_detail="migration unit is not approved",
+        steps=[
+            StepResult(
+                name="translate",
+                status="FAILED",
+                duration_seconds=0.01,
+                detail="migration unit is not approved",
+            )
+        ],
+        decisions=[],
+        started_at=_now(),
+        finished_at=_now(),
+    )
+
+
+def test_run_reports_pass_and_exits_zero(monkeypatch):
+    monkeypatch.setattr(cli, "env_status", lambda name: _env(name))
+    recorded_calls: list[tuple[object, object]] = []
+
+    def _fake_run_loop(env, client):
+        recorded_calls.append((env, client))
+        return _pass_report(env.name)
+
+    monkeypatch.setattr(cli, "run_loop", _fake_run_loop)
+    written: dict[str, object] = {}
+
+    def _fake_write_report(report, directory):
+        written["report"] = report
+        written["directory"] = directory
+        return directory / "report.md", directory / "report.json"
+
+    monkeypatch.setattr(cli, "write_report", _fake_write_report)
+
+    result = runner.invoke(cli.app, ["run", "demo"])
+
+    assert result.exit_code == 0, result.output
+    assert "PASS" in result.output
+    assert len(recorded_calls) == 1
+    env_arg, client_arg = recorded_calls[0]
+    assert env_arg.name == "demo"
+    assert isinstance(client_arg, cli.PrizmanyxClient)
+    assert written["report"].verdict == "PASS"
+
+
+def test_run_defaults_to_localhost_8000_and_honors_the_prizmanyx_flag(monkeypatch):
+    monkeypatch.setattr(cli, "env_status", lambda name: _env(name))
+    monkeypatch.setattr(cli, "write_report", lambda _report, directory: (directory, directory))
+    captured_urls: list[str] = []
+
+    class _RecordingClient(cli.PrizmanyxClient):
+        def __init__(self, base_url, *args, **kwargs):
+            captured_urls.append(base_url)
+            super().__init__(base_url, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "PrizmanyxClient", _RecordingClient)
+    monkeypatch.setattr(cli, "run_loop", lambda env, _client: _pass_report(env.name))
+
+    runner.invoke(cli.app, ["run", "demo"])
+    assert captured_urls == ["http://localhost:8000"]
+
+    runner.invoke(cli.app, ["run", "demo", "--prizmanyx", "http://example.test:9000"])
+    assert captured_urls[-1] == "http://example.test:9000"
+
+
+def test_run_reports_fail_and_exits_nonzero_naming_the_failed_step(monkeypatch):
+    monkeypatch.setattr(cli, "env_status", lambda name: _env(name))
+    monkeypatch.setattr(cli, "run_loop", lambda env, _client: _fail_report(env.name))
+    monkeypatch.setattr(
+        cli, "write_report", lambda _report, directory: (directory / "report.md", directory)
+    )
+
+    result = runner.invoke(cli.app, ["run", "demo"])
+
+    assert result.exit_code != 0
+    assert "FAIL" in result.output
+    assert "translate" in result.output
+    assert "migration unit is not approved" in result.output
+
+
+def test_run_of_an_unknown_environment_fails_with_a_message_and_never_calls_run_loop(monkeypatch):
+    def _boom(name):
+        raise EnvNotFoundError(f"no tracked environment named {name!r}")
+
+    monkeypatch.setattr(cli, "env_status", _boom)
+    monkeypatch.setattr(
+        cli, "run_loop", lambda *_: pytest.fail("run_loop must not be called for an unknown env")
+    )
+
+    result = runner.invoke(cli.app, ["run", "ghost"])
+
+    assert result.exit_code != 0
+    assert "no tracked environment named 'ghost'" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_run_closes_the_client_even_when_run_loop_raises_unexpectedly(monkeypatch):
+    # run_loop's own contract is "never raises LoopStepError", but a genuine
+    # bug raising anything else must not leak the client's connection pool.
+    monkeypatch.setattr(cli, "env_status", lambda name: _env(name))
+    closed = []
+
+    class _TrackingClient(cli.PrizmanyxClient):
+        def close(self):
+            closed.append(True)
+            super().close()
+
+    monkeypatch.setattr(cli, "PrizmanyxClient", _TrackingClient)
+
+    def _boom(_env, _client):
+        raise RuntimeError("unexpected bug")
+
+    monkeypatch.setattr(cli, "run_loop", _boom)
+
+    with pytest.raises(RuntimeError, match="unexpected bug"):
+        runner.invoke(cli.app, ["run", "demo"], catch_exceptions=False)
+
+    assert closed == [True]
+
+
 # --- the surface itself -----------------------------------------------------
 
 
@@ -384,7 +536,7 @@ def test_version_still_prints_the_package_version():
     assert result.output.strip() == cli.__version__
 
 
-@pytest.mark.parametrize("command", ["create", "ls", "rm"])
+@pytest.mark.parametrize("command", ["create", "ls", "rm", "run"])
 def test_every_command_is_registered_on_the_app(command):
     result = runner.invoke(cli.app, ["--help"])
 
