@@ -172,15 +172,27 @@ def test_virtual_machine_put_is_minimal_and_correctly_typed() -> None:
 # --- dbforpostgresql flexible server (RDS) - not spike-proven, minimal ------
 
 
-def test_postgres_flexible_server_put_is_minimal_and_correctly_typed() -> None:
+def test_postgres_flexible_server_put_is_the_live_proven_202_shape() -> None:
+    # Body proven LIVE against floci-az (2026-08-31): administratorLogin (etc.)
+    # are REQUIRED (400 without them) and are throwaway emulator placeholders.
+    # This create returns 202 (async) — Task 3's materializer polls it to
+    # provisioningState=Succeeded before verify.
     put = azure_native_to_arm_put("azure_native.dbforpostgresql.Server", "web-db", "spike-rg", {})
     assert put is not None
     assert put.path == (
         "resourceGroups/spike-rg/providers/Microsoft.DBforPostgreSQL/flexibleServers/web-db"
     )
     assert put.api_version == "2022-12-01"
-    assert put.body["location"] == "eastus"
-    assert "sku" in put.body
+    assert put.body == {
+        "location": "eastus",
+        "sku": {"name": "Standard_B1ms", "tier": "Burstable"},
+        "properties": {
+            "administratorLogin": "pgadmin",
+            "administratorLoginPassword": "Placeholder1!",
+            "version": "16",
+            "storage": {"storageSizeGB": 32},
+        },
+    }
 
 
 # --- unmapped token ---------------------------------------------------------

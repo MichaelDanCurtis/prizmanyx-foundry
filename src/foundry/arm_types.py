@@ -193,8 +193,17 @@ def azure_native_to_arm_put(
                 },
             )
         case "azure_native.dbforpostgresql.Server":
-            # NOT spike-proven. Minimal placeholder body (Flexible Server API;
-            # single-server is retired). sku + version are placeholders.
+            # Flexible Server API (single-server is retired). Body shape proven
+            # LIVE against floci-az (2026-08-31): it returns 400 without
+            # administratorLogin, so administratorLogin / administratorLoginPassword
+            # / version / storage are ALL REQUIRED. These are throwaway
+            # local-emulator placeholders — floci-az needs no real credential and
+            # this never touches real Azure.
+            #
+            # ASYNC CREATE — returns 202, NOT the synchronous 200/201 every other
+            # type in this table returns. Task 3's materializer MUST poll this
+            # resource to provisioningState=Succeeded before verify reads it, or
+            # verify races a still-provisioning server and reports it missing.
             return ArmPut(
                 path=_provider_path(
                     resource_group,
@@ -205,7 +214,12 @@ def azure_native_to_arm_put(
                 body={
                     "location": location,
                     "sku": {"name": "Standard_B1ms", "tier": "Burstable"},
-                    "properties": {"version": "15"},
+                    "properties": {
+                        "administratorLogin": "pgadmin",
+                        "administratorLoginPassword": "Placeholder1!",
+                        "version": "16",
+                        "storage": {"storageSizeGB": 32},
+                    },
                 },
             )
 
