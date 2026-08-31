@@ -126,6 +126,20 @@ class EnvState(BaseModel):
     timing comparison assumed they did. Treat the two as "this
     environment's own recorded existence" versus "this container's own
     recorded existence", never as interchangeable.
+
+    `children` is the ownership-by-recording list: `tf_runner.apply`
+    snapshots `docker ps` (running, `floci-`-prefixed) immediately before
+    and immediately after each real `terraform apply`, and the names that
+    only appear in the second snapshot - this apply's own floci real-engine
+    children (RDS/EC2/ElastiCache backing containers, see
+    `CHILD_NAME_PREFIXES`) - are unioned in here and persisted. `None`
+    means this environment has never had a recorded apply - either it
+    predates this field, or `create_env` made it but nothing has been
+    applied to it yet - and `engine.remove_env` falls back to the
+    `created_at`-based heuristic (`select_children_to_reap`) for those. An
+    empty list is a different, authoritative statement: an apply WAS
+    recorded and it spawned zero children. `engine.remove_env` treats
+    non-None as the primary, exact reap list - see its own docstring.
     """
 
     name: str
@@ -134,6 +148,7 @@ class EnvState(BaseModel):
     spec_path: Path
     seed: int | None = None
     status: str = "running"
+    children: list[str] | None = None
 
 
 def ensure_env_dir(name: str) -> Path:

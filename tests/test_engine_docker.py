@@ -21,6 +21,19 @@ review found in an earlier version of `select_children_to_reap`:
       could reap that live environment's own parent container outright.
 
 Both are asserted here as "spared, not reaped" - the corrected behavior.
+
+Task 4 added ownership-by-recording (`EnvState.children`, populated by
+`tf_runner.apply`'s docker-ps-delta): `remove_env` now has a PRIMARY reap
+path (recorded children, exact) and a FALLBACK path (this file's own
+`select_children_to_reap` heuristic, for environments with no recording).
+The "remove_env: recorded-children primary path vs heuristic fallback"
+section below exercises `remove_env`'s REAL dispatch between the two -
+via a fake `run_docker` and an isolated on-disk state dir, not a real
+docker daemon - so the branch choice itself is proven, not just each
+path's own already-tested internals. The first LIVE proof that recorded
+children actually get removed from a real, still-running container is
+`tests/test_apply_docker.py`'s `@pytest.mark.docker` acceptance test, not
+here.
 """
 
 from __future__ import annotations
@@ -37,6 +50,7 @@ from foundry.engine import (
     PORT_RANGE_END,
     PORT_RANGE_START,
     ContainerRow,
+    RemovalReport,
     _parse_docker_ps_output,
     allocate_port,
     container_name,
@@ -272,6 +286,112 @@ def test_select_children_to_reap_auto_reaps_nothing_once_two_environments_are_al
 
     assert with_older.reap == []
     assert with_younger.reap == []
+
+
+# --- remove_env: recorded-children PRIMARY path vs heuristic FALLBACK ------
+
+
+class _FakeDocker:
+    """Records every `run_docker` call `remove_env` makes and answers a
+    `ps -a --filter name=floci-` call with a canned table; every other call
+    (`rm -f`, ...) succeeds trivially. Lets `remove_env`'s REAL dispatch
+    logic run end-to-end - not a reimplementation of it - against
+    controlled `docker ps` output with no real docker daemon involved.
+    """
+
+    def __init__(self, ps_stdout: str = ""):
+        self.ps_stdout = ps_stdout
+        self.calls: list[list[str]] = []
+
+    def __call__(self, args: list[str]) -> subprocess.CompletedProcess[str]:
+        # remove_env's own call sites never pass `timeout=` explicitly
+        # (they all rely on run_docker's own default), so this fake never
+        # needs to accept or honor one - matching this file's existing
+        # `_must_not_be_called` double, just above.
+        self.calls.append(args)
+        if args[:2] == ["ps", "-a"]:
+            return subprocess.CompletedProcess(args, 0, stdout=self.ps_stdout, stderr="")
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+
+def _save_env_in_isolated_dir(tmp_path, monkeypatch, env_state: EnvState) -> None:
+    monkeypatch.setattr(state, "ENVS_DIR", tmp_path / "envs")
+    state.save_state(env_state)
+
+
+def test_remove_env_reaps_exactly_the_recorded_children_when_present(tmp_path, monkeypatch):
+    target = _env("target", datetime(2026, 1, 1, tzinfo=UTC)).model_copy(
+        update={"children": ["floci-ec2-i-abc", "floci-rds-db-xyz"]}
+    )
+    _save_env_in_isolated_dir(tmp_path, monkeypatch, target)
+    fake_docker = _FakeDocker()
+    monkeypatch.setattr("foundry.engine.run_docker", fake_docker)
+
+    report = remove_env("target")
+
+    assert sorted(report.reaped) == ["floci-ec2-i-abc", "floci-rds-db-xyz"]
+    assert report.spared == []
+    assert report.unparsed == []
+    # The primary path never needs a `docker ps` sweep at all - it already
+    # knows exactly what to remove, so it must never even ask.
+    assert not any(call[:2] == ["ps", "-a"] for call in fake_docker.calls)
+    assert not state.state_file("target").exists()
+
+
+def test_remove_env_reaps_nothing_when_a_recorded_apply_spawned_zero_children(
+    tmp_path, monkeypatch
+):
+    # `children == []` is NOT "never recorded" (that's `None`, the
+    # fallback trigger) - it is the authoritative "an apply happened and
+    # spawned nothing" - still the primary path, no heuristic sweep.
+    target = _env("target", datetime(2026, 1, 1, tzinfo=UTC)).model_copy(update={"children": []})
+    _save_env_in_isolated_dir(tmp_path, monkeypatch, target)
+    fake_docker = _FakeDocker()
+    monkeypatch.setattr("foundry.engine.run_docker", fake_docker)
+
+    report = remove_env("target")
+
+    assert report == RemovalReport(reaped=[], spared=[], unparsed=[])
+    assert not any(call[:2] == ["ps", "-a"] for call in fake_docker.calls)
+
+
+def test_remove_env_falls_back_to_the_heuristic_when_children_was_never_recorded(
+    tmp_path, monkeypatch
+):
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    target = _env("target", t0)  # children defaults to None: never recorded
+    assert target.children is None
+    _save_env_in_isolated_dir(tmp_path, monkeypatch, target)
+    ps_stdout = "floci-ec2-i-orphan\t2026-01-01 00:01:00 +0000 UTC\n"
+    fake_docker = _FakeDocker(ps_stdout=ps_stdout)
+    monkeypatch.setattr("foundry.engine.run_docker", fake_docker)
+
+    report = remove_env("target")
+
+    assert report.reaped == ["floci-ec2-i-orphan"]
+    assert report.spared == []
+    assert report.unparsed == []
+    # The fallback path DOES need the docker ps sweep - that's the point.
+    assert any(call[:2] == ["ps", "-a"] for call in fake_docker.calls)
+
+
+def test_remove_env_fallback_still_spares_what_it_cannot_attribute(tmp_path, monkeypatch):
+    # A minimal end-to-end proof that the fallback path, reached through
+    # remove_env's real dispatch (not select_children_to_reap called
+    # directly, which the tests above this section already cover
+    # exhaustively), still honors the same conservatism: a row created
+    # before target is spared, not reaped.
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    target = _env("target", t0)
+    _save_env_in_isolated_dir(tmp_path, monkeypatch, target)
+    ps_stdout = "floci-ec2-i-too-old\t2025-12-31 23:59:00 +0000 UTC\n"
+    fake_docker = _FakeDocker(ps_stdout=ps_stdout)
+    monkeypatch.setattr("foundry.engine.run_docker", fake_docker)
+
+    report = remove_env("target")
+
+    assert report.reaped == []
+    assert report.spared == ["floci-ec2-i-too-old"]
 
 
 # --- docker ps transcript parsing (real STDOUT shape, tolerant of junk) -----

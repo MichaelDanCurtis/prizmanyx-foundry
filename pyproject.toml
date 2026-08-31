@@ -23,6 +23,7 @@ packages = ["src/foundry"]
 
 [dependency-groups]
 dev = [
+    "boto3>=1.43.83",
     "pytest>=8.0",
     "ruff>=0.6",
 ]

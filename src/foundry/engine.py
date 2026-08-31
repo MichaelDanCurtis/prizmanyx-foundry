@@ -452,26 +452,41 @@ def remove_env(name: str) -> RemovalReport:
     on-disk state - and report exactly what happened.
 
     Order: remove the parent first (fast, always safe, best-effort - an
-    already-gone parent is not fatal), THEN sweep for surviving children
-    (which the spike found only matter once the parent's gone), THEN delete
-    the state directory last. That ordering means a failure partway through
-    leaves `list_envs`/`env_status` still able to see this environment and
-    a retry able to pick up whatever this call did not finish, rather than
-    an environment that vanished from tracking while containers of its own
-    were still running.
+    already-gone parent is not fatal), THEN reap children (recorded or
+    swept, see below - the spike found children only matter once the
+    parent's gone), THEN delete the state directory last. That ordering
+    means a failure partway through leaves `list_envs`/`env_status` still
+    able to see this environment and a retry able to pick up whatever this
+    call did not finish, rather than an environment that vanished from
+    tracking while containers of its own were still running.
 
-    This does NOT promise "reaps every orphan and nothing else" - that was
-    an earlier, false claim this docstring made, and a fix-round review
-    reproduced two ways it broke (an older live environment's child reaped
-    by a younger peer's removal; a live peer's own parent container reaped
-    outright when its name happened to collide with CHILD_NAME_PREFIXES).
-    The true, narrower guarantee `select_children_to_reap` actually
-    provides: this never reaps a container it cannot confidently attribute
-    to `name` alone. Ambiguous rows survive as `RemovalReport.spared` for a
-    human (or a future prune command) to act on, rather than being guessed
-    at and possibly torn out from under a still-live peer environment.
-    Rows this engine could not even parse survive as `RemovalReport.unparsed`
-    for the same reason - never touched, never guessed at.
+    Two reap strategies, chosen by whether `target.children` was ever
+    recorded (see `EnvState.children`'s own docstring for exactly what
+    `None` versus `[]` means):
+
+    - PRIMARY (`target.children is not None`): reap exactly that list, no
+      more, no less. `tf_runner.apply`'s before/after `docker ps` delta
+      already knows precisely which containers this environment's own
+      terraform spawned - there is nothing left to guess, so nothing is
+      spared and nothing is unparsed. A name already gone (removed by a
+      prior `destroy()`, or by hand) is the same best-effort no-op the
+      parent container's own removal above already is.
+    - FALLBACK (`target.children is None`, i.e. never recorded - an
+      environment from before this field existed, or one nothing has ever
+      been applied to): the original `created_at`-based heuristic sweep,
+      `select_children_to_reap`. This does NOT promise "reaps every orphan
+      and nothing else" - that was an earlier, false claim this docstring
+      made, and a fix-round review reproduced two ways it broke (an older
+      live environment's child reaped by a younger peer's removal; a live
+      peer's own parent container reaped outright when its name happened
+      to collide with CHILD_NAME_PREFIXES). The true, narrower guarantee
+      `select_children_to_reap` actually provides: this never reaps a
+      container it cannot confidently attribute to `name` alone. Ambiguous
+      rows survive as `RemovalReport.spared` for a human (or a future prune
+      command) to act on, rather than being guessed at and possibly torn
+      out from under a still-live peer environment. Rows this engine could
+      not even parse survive as `RemovalReport.unparsed` for the same
+      reason - never touched, never guessed at.
     """
     try:
         target = state.load_state(name)
@@ -479,6 +494,12 @@ def remove_env(name: str) -> RemovalReport:
         raise EnvNotFoundError(f"no tracked environment named {name!r}") from exc
 
     run_docker(["rm", "-f", container_name(name)])  # best-effort: already-gone is fine.
+
+    if target.children is not None:
+        for child_name in target.children:
+            run_docker(["rm", "-f", child_name])
+        state.delete_env_dir(name)
+        return RemovalReport(reaped=list(target.children), spared=[], unparsed=[])
 
     # Includes `target` itself (its state.json is not deleted yet) -
     # select_children_to_reap excludes it from "other" on its own.
