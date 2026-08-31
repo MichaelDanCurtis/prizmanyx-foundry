@@ -399,15 +399,17 @@ class PrizmanyxClient:
     ) -> JSONObject:
         """Register the foundry environment's AWS endpoint as this program's
         source connection. `endpoint_url` is a required parameter, never
-        hardcoded here: the Prizmanyx backend runs on the HOST, so from ITS
-        perspective a foundry environment is `http://localhost:<port>` even
-        though the same environment is `http://host.docker.internal:<port>`
-        from inside the terraform container the foundry itself drives - the
-        caller decides which form applies, this method just carries it.
-        `region` defaults to `"us-east-1"` because every floci-backed
-        environment forces that region (see this repo's own
-        `aws_connect_models.LocalStackConnectRequest`, which requires it
-        with no default) - overridable, never assumed silently.
+        hardcoded here: the endpoint must be reachable from wherever Prizmanyx
+        actually EXTRACTS, which is its Temporal worker CONTAINER, not the API
+        process - so the caller passes `http://host.docker.internal:<port>`
+        (the worker-reachable form; see `loop.worker_reachable_endpoint`), NOT
+        `http://localhost:<port>` (which inside the worker container means the
+        container itself, and which the foundry's own host-side boto3
+        verification uses instead). This method just carries whatever form the
+        caller decides. `region` defaults to `"us-east-1"` because every
+        floci-backed environment forces that region (see this repo's own
+        `aws_connect_models.LocalStackConnectRequest`, which requires it with
+        no default) - overridable, never assumed silently.
         """
         response = self._request(
             "register_env_connection",

@@ -388,6 +388,13 @@ def _random_vpc(rng: random.Random, subnet_count: int) -> VpcSpec:
     vpc than `_AZ_SUFFIXES` has entries would need to widen that tuple
     first; this function does not silently wrap around and repeat one.
     """
+    if subnet_count > len(_AZ_SUFFIXES):
+        # Fail loud rather than IndexError, if a future profile ever asks for
+        # more subnets-per-vpc than we have distinct AZ letters for.
+        raise ValueError(
+            f"subnet_count {subnet_count} exceeds the {len(_AZ_SUFFIXES)} distinct "
+            f"AZ suffixes available ({', '.join(_AZ_SUFFIXES)}); widen _AZ_SUFFIXES"
+        )
     octet = rng.randint(0, 255)
     subnets = [
         SubnetSpec(cidr=f"10.{octet}.{subnet_idx}.0/24", az_suffix=_AZ_SUFFIXES[subnet_idx])

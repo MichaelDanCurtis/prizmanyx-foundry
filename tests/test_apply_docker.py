@@ -220,8 +220,17 @@ ENV_NAME_APPLY = "t4-apply-test"
 def test_apply_then_destroy_round_trips_resources_via_boto3():
     spec = EnvSpec(
         name_prefix="t4-apply-demo",
+        # Two subnets in distinct AZs: an RDS DB subnet group requires >=2, so
+        # any spec carrying a database must span them (see materialize.py's
+        # fail-loud check and envspec._random_vpc).
         vpcs=[
-            VpcSpec(cidr="10.40.0.0/16", subnets=[SubnetSpec(cidr="10.40.0.0/24", az_suffix="a")])
+            VpcSpec(
+                cidr="10.40.0.0/16",
+                subnets=[
+                    SubnetSpec(cidr="10.40.0.0/24", az_suffix="a"),
+                    SubnetSpec(cidr="10.40.1.0/24", az_suffix="b"),
+                ],
+            )
         ],
         instances=[InstanceSpec(subnet_index=0, instance_type="t3.micro", count=1)],
         databases=[DatabaseSpec(engine="postgres", instance_class="db.t3.micro", count=1)],
@@ -233,9 +242,9 @@ def test_apply_then_destroy_round_trips_resources_via_boto3():
 
         result = apply(env)
         assert result.ok, result.transcript_path.read_text()
-        # 1 vpc + 1 subnet + 1 instance + 1 db + 1 bucket = 5, matching
-        # envspec.total_resource_count's own counting rule for this spec.
-        assert result.resources_applied == 5
+        # 1 vpc + 2 subnets + 1 instance + 1 db + 1 db_subnet_group (emitted
+        # because the spec has a database) + 1 bucket = 7 terraform resources.
+        assert result.resources_applied == 7
 
         applied_env = state.load_state(ENV_NAME_APPLY)
         assert applied_env.children, "apply() must record every child it spawned"
