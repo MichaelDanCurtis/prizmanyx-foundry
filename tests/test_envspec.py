@@ -6,6 +6,7 @@ fails until that file lands (the TDD red step for this task).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ import yaml
 from pydantic import ValidationError
 
 from foundry.envspec import (
+    _NAME_PREFIX_PATTERN,
     BucketSpec,
     DatabaseSpec,
     EnvSpec,
@@ -87,6 +89,15 @@ def test_random_spec_subnet_indices_are_always_in_range(size):
     assert all(0 <= instance.subnet_index < subnet_count for instance in spec.instances)
 
 
+@pytest.mark.parametrize("size", SIZES)
+def test_random_spec_name_prefix_always_conforms_to_the_pattern(size):
+    # A pathologically large (and a negative) seed stress the bound that
+    # keeps name_prefix short and sign-free regardless of `seed`'s shape.
+    for seed in (0, -1, 42, 10**18):
+        spec = random_spec(size, seed=seed)
+        assert re.fullmatch(_NAME_PREFIX_PATTERN, spec.name_prefix), spec.name_prefix
+
+
 def test_random_spec_round_trips_through_yaml(tmp_path):
     spec = random_spec("S", seed=5)
     out_path = tmp_path / "roundtrip.yaml"
@@ -131,6 +142,44 @@ def test_negative_counts_are_rejected_on_every_group_type(build):
 def test_database_engine_is_restricted_to_the_supported_literals():
     with pytest.raises(ValidationError):
         DatabaseSpec(engine="oracle", instance_class="db.t3.micro", count=1)
+
+
+def test_instance_spec_rejects_a_negative_subnet_index_on_its_own():
+    # Standalone construction (no enclosing EnvSpec to run the cross-
+    # reference check) must still reject a negative index on its own -
+    # otherwise a caller that builds InstanceSpec directly gets no
+    # protection at all until it happens to land inside an EnvSpec.
+    with pytest.raises(ValidationError, match="subnet_index"):
+        InstanceSpec(subnet_index=-1, instance_type="t3.micro", count=1)
+
+
+# --- EnvSpec: name_prefix shape validation ------------------------------------
+# Task 4 interpolates name_prefix into terraform resource names
+# (`<name_prefix>-vpc-0`, ...), so it is shape-validated at this boundary
+# rather than trusted through to the emitter (the plan's two-sided
+# injection lesson: validate at the boundary AND fail loud at the
+# emitter). Pattern sized for suffixes: 24 chars after the leading letter
+# leaves room for `-vpc-NN`-style additions under common AWS name caps.
+
+
+def test_name_prefix_rejects_uppercase_and_underscores():
+    with pytest.raises(ValidationError, match=re.escape(_NAME_PREFIX_PATTERN)):
+        EnvSpec(name_prefix="Bad_Prefix")
+
+
+def test_name_prefix_rejects_the_empty_string():
+    with pytest.raises(ValidationError, match=re.escape(_NAME_PREFIX_PATTERN)):
+        EnvSpec(name_prefix="")
+
+
+def test_name_prefix_rejects_26_or_more_characters():
+    with pytest.raises(ValidationError, match=re.escape(_NAME_PREFIX_PATTERN)):
+        EnvSpec(name_prefix="a" * 26)
+
+
+def test_name_prefix_accepts_25_characters_at_the_boundary():
+    spec = EnvSpec(name_prefix="a" * 25)
+    assert spec.name_prefix == "a" * 25
 
 
 # --- EnvSpec: subnet_index cross-reference validation ------------------------

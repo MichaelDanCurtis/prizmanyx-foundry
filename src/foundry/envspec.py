@@ -47,11 +47,13 @@ class InstanceSpec(BaseModel):
 
     `subnet_index` indexes into EnvSpec's flattened subnet list (every
     vpc's subnets, in vpc order then subnet order) - not a per-vpc index.
-    EnvSpec validates that it lands in range; this model can't, since it
+    The `ge=0` below rejects a negative index even on a standalone
+    InstanceSpec built outside an EnvSpec; the *upper* bound (< the actual
+    subnet count) still needs EnvSpec's own validator, since this model
     can't see the other vpcs on its own.
     """
 
-    subnet_index: int
+    subnet_index: int = Field(ge=0)
     instance_type: str
     count: int = Field(ge=0)
 
@@ -83,17 +85,29 @@ class RoleSpec(BaseModel):
     count: int = Field(ge=0)
 
 
+# Task 4 interpolates name_prefix into terraform resource names
+# (`<name_prefix>-vpc-0`, ...), so it is shape-validated here, at the
+# boundary where an untrusted YAML file (or a caller) first supplies it -
+# the plan's two-sided injection lesson: validate at the boundary AND fail
+# loud at the emitter. Lowercase-start, lowercase/digit/hyphen body, same
+# family as the env-name pattern but sized for suffixes: 24 characters
+# after the leading letter leaves room for `-vpc-NN`-style additions under
+# common AWS resource-name length caps.
+_NAME_PREFIX_PATTERN = r"^[a-z][a-z0-9-]{0,24}$"
+
+
 class EnvSpec(BaseModel):
     """The full description of a Floci-backed AWS estate.
 
     Every `count` field across instances/databases/buckets/queues/roles
     must be >=0 (enforced per-field on each group's own model above). Every
-    `instances[i].subnet_index` must land within the flattened list of
-    every vpc's subnets (enforced below - only EnvSpec can see all vpcs at
-    once).
+    `instances[i].subnet_index` must be >=0 (also enforced on InstanceSpec
+    itself) and land within the flattened list of every vpc's subnets
+    (enforced below - only EnvSpec can see all vpcs at once). `name_prefix`
+    must match `_NAME_PREFIX_PATTERN` (see its comment for why).
     """
 
-    name_prefix: str
+    name_prefix: str = Field(pattern=_NAME_PREFIX_PATTERN)
     vpcs: list[VpcSpec] = Field(default_factory=list)
     instances: list[InstanceSpec] = Field(default_factory=list)
     databases: list[DatabaseSpec] = Field(default_factory=list)
@@ -316,8 +330,13 @@ def random_spec(size: Literal["S", "M", "L", "XL"], seed: int) -> EnvSpec:
     queues = [QueueSpec(count=profile.queues_per_group) for _ in range(profile.n_queue_groups)]
     roles = [RoleSpec(count=profile.roles_per_group) for _ in range(profile.n_role_groups)]
 
+    # `seed` is an unbounded int (any sign, any number of digits); `%` with
+    # a positive modulus always yields a non-negative result in Python, so
+    # this stays within _NAME_PREFIX_PATTERN's shape and length no matter
+    # how large or negative the caller's seed is.
+    name_suffix = seed % 100_000
     return EnvSpec(
-        name_prefix=f"foundry-{size.lower()}-{seed}",
+        name_prefix=f"foundry-{size.lower()}-{name_suffix}",
         vpcs=vpcs,
         instances=instances,
         databases=databases,
