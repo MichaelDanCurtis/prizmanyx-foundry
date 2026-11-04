@@ -5,12 +5,15 @@ from a Pulumi azure-native token (what the translator/codegen emit) to the
 exact ARM PUT (path, api-version, body) the deploy half of slice 4 issues at a
 per-env floci-az.
 
-The oracle for every shape is docs/superpowers/specs/2026-08-30-floci-spike-findings.md
-(Leg 3, Step 2 Probe 1): the five shapes that PUT/GET clean against floci-az,
-200/201, unauthenticated. VM and Postgres were NOT in that proven set - they
-carry minimal, placeholder bodies (see the module docstring), so their tests
-assert only the structural half (path type + name + api-version + location),
-which is all structural verify checks.
+The oracle for the original five shapes is
+docs/superpowers/specs/2026-08-30-floci-spike-findings.md (Leg 3, Step 2 Probe
+1): the five that PUT/GET clean against floci-az, 200/201, unauthenticated.
+Postgres (2026-08-31) and NetworkInterface (2026-09-02) were proven live
+afterwards against the same digest-pinned image, and their tests assert the
+exact proven body. VM alone is still unproven - it carries a minimal
+placeholder body (see the module docstring), so its test asserts only the
+structural half (path type + name + api-version + location), which is all
+structural verify checks.
 
 Cross-repo contract guard (_EXPECTED_ARM_TYPE): each token's PUT path embeds an
 ARM provider/resourceType that, lowercased, must equal the key the Prizmanyx
@@ -42,6 +45,7 @@ _EXPECTED_ARM_TYPE = {
     "azure_native.network.VirtualNetwork": "microsoft.network/virtualnetworks",
     "azure_native.network.Subnet": "microsoft.network/virtualnetworks/subnets",
     "azure_native.network.NetworkSecurityGroup": "microsoft.network/networksecuritygroups",
+    "azure_native.network.NetworkInterface": "microsoft.network/networkinterfaces",
     "azure_native.compute.VirtualMachine": "microsoft.compute/virtualmachines",
     "azure_native.dbforpostgresql.Server": "microsoft.dbforpostgresql/flexibleservers",
 }
@@ -154,6 +158,49 @@ def test_network_security_group_put() -> None:
     )
     assert put.api_version == "2023-04-01"
     assert put.body == {"location": "eastus", "properties": {"securityRules": []}}
+
+
+# --- network interface (ENI) - live-proven 2026-09-02 -----------------------
+
+
+def test_network_interface_put_is_the_live_proven_body() -> None:
+    put = azure_native_to_arm_put(
+        "azure_native.network.NetworkInterface", "web-nic", "spike-rg", {}
+    )
+    assert put is not None
+    assert (
+        put.path == "resourceGroups/spike-rg/providers/Microsoft.Network/networkInterfaces/web-nic"
+    )
+    assert put.api_version == "2023-04-01"
+    # Location-only is the MINIMAL body floci-az accepts (probe A, 200), and it
+    # reads back with a synthesized ipConfigurations entry nobody sent. The
+    # omission of ipConfigurations is deliberate, not an oversight: a real
+    # Azure NIC needs a subscription-qualified subnet id, and this function is
+    # never given the subscription - see the match arm's probe record.
+    assert put.body == {"location": "eastus"}
+
+
+def test_network_interface_carries_no_fabricated_subnet_reference() -> None:
+    # Guards the decision directly: if someone later adds an ipConfigurations
+    # entry here, it can only be built from a subscription this function does
+    # not receive, so the id would be invented. Fail loudly if that appears.
+    put = azure_native_to_arm_put(
+        "azure_native.network.NetworkInterface",
+        "web-nic",
+        "spike-rg",
+        {"subnet_id": "/subscriptions/whatever/resourceGroups/x/…"},
+    )
+    assert put is not None
+    assert "ipConfigurations" not in put.body.get("properties", {})
+    assert "subscriptions" not in str(put.body)
+
+
+def test_network_interface_location_override() -> None:
+    put = azure_native_to_arm_put(
+        "azure_native.network.NetworkInterface", "web-nic", "spike-rg", {"location": "westus2"}
+    )
+    assert put is not None
+    assert put.body == {"location": "westus2"}
 
 
 # --- compute VM (EC2) - not spike-proven, minimal placeholder body ----------
@@ -283,6 +330,7 @@ def test_supported_tokens_matches_the_documented_set() -> None:
                 "azure_native.network.VirtualNetwork",
                 "azure_native.network.Subnet",
                 "azure_native.network.NetworkSecurityGroup",
+                "azure_native.network.NetworkInterface",
                 "azure_native.compute.VirtualMachine",
                 "azure_native.dbforpostgresql.Server",
             }
