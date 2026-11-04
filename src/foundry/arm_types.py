@@ -27,13 +27,23 @@ Two contract edges this module must hold exactly, or the round-trip breaks:
 **The proven set vs. the placeholders.** The five shapes RG / StorageAccount /
 VirtualNetwork / Subnet / NetworkSecurityGroup are the ones the floci spike
 PUT/GET clean, 200/201, unauthenticated (findings doc Leg 3, Step 2 Probe 1) -
-their bodies are copied verbatim from that evidence. VirtualMachine and the
-PostgreSQL flexible Server were NOT in the proven set; structural verify only
-checks a resource EXISTS at its type+name, so their bodies are deliberately
-minimal placeholders (location plus the smallest structurally-plausible shape),
-documented as such, and lean on floci-az's demonstrated leniency (it
-synthesized a full default-rule set from an empty NSG ``securityRules`` array,
-i.e. it is additive, not strict).
+their bodies are copied verbatim from that evidence. The PostgreSQL flexible
+Server and the NetworkInterface were each proven live afterwards, against the
+same digest-pinned image, and carry their probe evidence at their match arm.
+VirtualMachine alone remains unproven; structural verify only checks a resource
+EXISTS at its type+name, so its body is a deliberately minimal placeholder
+(location plus the smallest structurally-plausible shape), documented as such,
+and leans on floci-az's demonstrated leniency (it synthesized a full
+default-rule set from an empty NSG ``securityRules`` array, i.e. it is
+additive, not strict - and does the same for a NIC's ``ipConfigurations``).
+
+**One caveat that is NOT this module's to fix.** floci-az's resource-group
+aggregation (``GET /resourceGroups/{rg}/resources``) omits
+``Microsoft.Compute/virtualMachines``: a VM PUTs 201 and reads back 200 at its
+own URL, but never appears in the listing Prizmanyx's verify bridge enumerates,
+so a mapped VM still reports ``missing``. Measured 2026-09-02.
+``networkInterfaces`` is NOT affected - it does appear in that listing - so
+mapping the NIC genuinely moves it from ``missing`` to matched.
 
 **None, not raise, for an unmapped token.** A token this table does not cover
 returns ``None``; the materializer logs and skips it, and the un-PUT resource
@@ -75,6 +85,7 @@ SUPPORTED_TOKENS: frozenset[str] = frozenset(
         "azure_native.network.VirtualNetwork",
         "azure_native.network.Subnet",
         "azure_native.network.NetworkSecurityGroup",
+        "azure_native.network.NetworkInterface",
         "azure_native.compute.VirtualMachine",
         "azure_native.dbforpostgresql.Server",
     }
@@ -179,6 +190,42 @@ def azure_native_to_arm_put(
                 ),
                 api_version="2023-04-01",
                 body={"location": location, "properties": {"securityRules": []}},
+            )
+        case "azure_native.network.NetworkInterface":
+            # Body proven LIVE against floci-az (2026-09-02, the digest-pinned
+            # image in engine.py). Probed four shapes at this exact path and
+            # api-version; ALL returned 200:
+            #   A {"location": "eastus"}                                 -> 200
+            #   B location + "properties":{"ipConfigurations": []}       -> 200
+            #   C location + an ipConfigurations entry naming a REAL subnet id
+            #                                                            -> 200
+            #   D the same entry naming a subnet that does NOT exist     -> 200
+            #
+            # So location-only is the minimal accepted body, and D proves
+            # floci-az does not validate the subnet reference at all. On a GET,
+            # A and B both read back with a SYNTHESIZED ipConfigurations entry
+            # (ipconfig1 / 10.0.0.4 / Dynamic / primary / Succeeded) that no
+            # request supplied - the same additive leniency this module already
+            # documents for the NSG's empty securityRules array.
+            #
+            # Location-only is therefore what ships, and the omission is
+            # deliberate rather than lazy. A real Azure NIC DOES require an
+            # ipConfigurations entry carrying a subscription-qualified subnet
+            # id - and this function is never given the subscription (the
+            # materializer prepends `subscriptions/{sub}/` afterwards, see the
+            # ArmPut docstring), so any id built here would have to invent one.
+            # Against floci-az that id is ignored (probe D); against real Azure
+            # a fabricated subscription would be actively wrong. Emitting
+            # neither fails loudly on real Azure instead of quietly creating a
+            # NIC pointing somewhere it should not.
+            #
+            # Synchronous: 200, no 202, so the materializer needs no poll.
+            return ArmPut(
+                path=_provider_path(
+                    resource_group, "Microsoft.Network/networkInterfaces", safe_name
+                ),
+                api_version="2023-04-01",
+                body={"location": location},
             )
         case "azure_native.compute.VirtualMachine":
             # NOT spike-proven. Minimal placeholder body - structural verify
